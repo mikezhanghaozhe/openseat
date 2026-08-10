@@ -86,3 +86,32 @@ subtly different reconnect and `seq`-dedupe implementations.
 
 **Consequence.** `web/` needs a separate TypeScript client (`web/src/lib/room.ts`) — two languages,
 not two designs. Generate shared types from the protocol schemas so they cannot drift.
+
+---
+ 
+## 2026-08-10 — Seed is secret during a hand
+ 
+**Decision.** The per-hand seed is withheld from every client-facing payload until the
+`hand_complete` event. The room's `master_seed` is never transmitted at all.
+ 
+**Why.** An earlier draft of PROTOCOL.md recorded the seed in the public `room_created` event.
+Anyone holding the seed and knowing the shuffle algorithm can compute every hole card at the
+table — a total break of hidden information. Caught during protocol review, before implementation.
+ 
+**Consequence.** Replay still works, because replay only needs the seed after the hand is over.
+Explicit seeds for tests require `ARENA_ALLOW_FIXED_SEED=1`, off in production. Three contract
+tests added in PROTOCOL.md §10.
+ 
+---
+ 
+## 2026-08-10 — Credentials in headers, WebSocket via short-lived ticket
+ 
+**Decision.** `seat_token` and `host_token` travel in `Authorization: Bearer`, never in query
+strings. WebSocket connections use a single-use 30-second ticket from `POST /rooms/{id}/ws-ticket`.
+ 
+**Why.** Query strings are written to proxy logs, browser history, and `Referer` headers, and a
+`seat_token` is long-lived. Browsers cannot set headers on a WebSocket handshake, so a short-lived
+ticket is the standard way to keep the durable credential out of the URL.
+ 
+**Consequence.** Clients need one extra round trip before connecting. `arena-client` hides this;
+`web/src/lib/room.ts` must implement it too.

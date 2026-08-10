@@ -49,6 +49,31 @@ These are not negotiable and no package may violate them.
 A `seat_token` is issued once when a seat is claimed and is the credential for every subsequent
 call. Losing it means losing the seat; reconnect uses the same token.
 
+Tokens are opaque capabilities — `secrets.token_urlsafe(32)`, held server-side, compared on every
+request. There are no accounts. Holding the token *is* the authorization.
+
+### Transport
+
+Credentials go in headers, never in query strings. Query strings are written to proxy logs,
+browser history, and `Referer` headers.
+
+```
+Authorization: Bearer sea_9dK...
+```
+
+Browsers cannot set headers on a WebSocket handshake. So the WS connection uses a **short-lived
+ticket** instead:
+
+```
+POST /v1/rooms/{id}/ws-ticket   Authorization: Bearer sea_9dK...
+  → { "ticket": "tkt_...", "expires_in": 30 }
+
+wss://host/v1/rooms/{id}/ws?ticket=tkt_...
+```
+
+The ticket is single-use, expires in 30 seconds, and maps server-side to the seat. A leaked ticket
+is worthless within half a minute; a leaked `seat_token` is not.
+
 ---
 
 ## 2. Notation
@@ -190,7 +215,7 @@ hidden information.** Every event has `{ seq, type, ts, ...payload }`.
 
 | `type` | Payload |
 |---|---|
-| `room_created` | `{ game, config, seats_total }` |
+| `room_created` | `{ game, config, seats_total }` — **no seed**, see §10 |
 | `seat_joined` | `{ seat, name, kind }` |
 | `seat_left` | `{ seat, reason }` |
 | `hand_started` | `{ hand_no, button, stacks: [...] }` |
@@ -202,7 +227,7 @@ hidden information.** Every event has `{ seq, type, ts, ...payload }`.
 | `table_talk` | `{ seat, name, text }` |
 | `showdown` | `{ reveals: [{ seat, hole, rank_class, description }] }` |
 | `pot_awarded` | `{ pots: [{ index, amount, winners: [seat], reason }] }` |
-| `hand_complete` | `{ hand_no, stacks: [...] }` |
+| `hand_complete` | `{ hand_no, stacks: [...], hand_seed }` — seed disclosed only here, see §10 |
 | `seat_timed_out` | `{ seat, forced_action }` |
 | `room_complete` | `{ final_stacks, ranking }` |
 
@@ -224,7 +249,9 @@ Base path `/v1`. All bodies JSON. All responses include `protocol_version`.
 { "room_id": "r_8fk2", "invite_token": "inv_...", "host_token": "hst_...",
   "seats": [{ "index": 0, "status": "open" }, ...] }
 ```
-`seed` is optional; if absent the server generates one and records it in `room_created`.
+`seed` is accepted **only** when the server runs with `ARENA_ALLOW_FIXED_SEED=1` (tests only —
+see §10). Otherwise the server draws its own and never discloses it during play. Per-hand seeds
+appear in `hand_complete` after the hand is over.
 
 ### `POST /rooms/{id}/seats`
 ```jsonc
@@ -243,7 +270,8 @@ beyond what's already public, or any token.
 ### `POST /rooms/{id}/start`
 `{ "host_token": "hst_..." }` → `{ "hand_no": 1, "to_act": 0, "seq": 12 }`
 
-### `GET /rooms/{id}/view?seat_token=...`
+### `GET /rooms/{id}/view`
+`Authorization: Bearer <seat_token>`
 → Observation (§4). This is a pure read; calling it never advances state.
 
 ### `POST /rooms/{id}/actions`
@@ -292,8 +320,8 @@ Every error body: `{ "error": "...", "reason": "human readable", ...context }`.
 
 ## 8. WebSocket (M2)
 
-`wss://host/v1/rooms/{id}/ws?seat_token=...`
-Spectators connect with `?invite_token=...` and receive `event` frames only — **never `state`.**
+`wss://host/v1/rooms/{id}/ws?ticket=...` — ticket obtained from `POST /rooms/{id}/ws-ticket`, see §1.
+Spectators obtain a spectator ticket with `invite_token` and receive `event` frames only — **never `state`.**
 
 **Server → client**
 ```jsonc
@@ -386,10 +414,32 @@ assert all(isinstance(c, Card) for c in state.hole_cards[i]), "hole cards not pa
 
 That assertion is cheap and turns a delayed mystery crash into an immediate one.
 
-### RNG
+### Seeding — the seed is a secret during a hand
 
-We own the deck. Shuffle with our seeded RNG and feed cards in explicitly — PokerKit does not need
-to generate randomness. This is what makes invariant #3 (§0) achievable.
+Each hand is dealt from a deck shuffled by a seeded RNG. **This does not make cards predictable:**
+the per-hand seed is drawn from `secrets.randbits(64)`, so every hand is unpredictable. What the
+seed buys is reproducibility — a transcript can be replayed exactly, a bug can be reproduced from
+a saved hand, and the same deck can be re-run against a different model.
+
+**But an exposed seed is an exposed deck.** Anyone holding the seed and knowing the shuffle can
+compute every hole card at the table. Therefore:
+
+| | During the hand | After `hand_complete` |
+|---|---|---|
+| `hand_seed` | Server memory + server-side transcript only. **Never** in a view, event, or response body. | Included in the `hand_complete` event |
+
+- The room holds a `master_seed`; each hand's seed is `derive(master_seed, hand_no)`.
+- `master_seed` is **never** transmitted to any client, ever — not even after the room ends.
+  Revealing it would expose every future hand in that room.
+- `room_created` does **not** carry a seed. (Earlier drafts of this document did. That was a bug.)
+- An explicit `seed` may be passed to `POST /rooms` **only when the server runs with
+  `ARENA_ALLOW_FIXED_SEED=1`**, which is off in production. This exists for tests and nothing else.
+
+### Contract tests this implies
+
+- [ ] No seed value appears in any view, event, or error body before `hand_complete`
+- [ ] `master_seed` never appears in any client-facing payload at any time
+- [ ] `POST /rooms` with an explicit seed is rejected when the fixed-seed flag is off
 
 ### Automation
 
