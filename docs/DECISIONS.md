@@ -88,30 +88,161 @@ subtly different reconnect and `seq`-dedupe implementations.
 not two designs. Generate shared types from the protocol schemas so they cannot drift.
 
 ---
- 
+
 ## 2026-08-10 — Seed is secret during a hand
- 
+
 **Decision.** The per-hand seed is withheld from every client-facing payload until the
 `hand_complete` event. The room's `master_seed` is never transmitted at all.
- 
+
 **Why.** An earlier draft of PROTOCOL.md recorded the seed in the public `room_created` event.
 Anyone holding the seed and knowing the shuffle algorithm can compute every hole card at the
 table — a total break of hidden information. Caught during protocol review, before implementation.
- 
+
 **Consequence.** Replay still works, because replay only needs the seed after the hand is over.
 Explicit seeds for tests require `ARENA_ALLOW_FIXED_SEED=1`, off in production. Three contract
 tests added in PROTOCOL.md §10.
- 
+
 ---
- 
+
 ## 2026-08-10 — Credentials in headers, WebSocket via short-lived ticket
- 
+
 **Decision.** `seat_token` and `host_token` travel in `Authorization: Bearer`, never in query
 strings. WebSocket connections use a single-use 30-second ticket from `POST /rooms/{id}/ws-ticket`.
- 
+
 **Why.** Query strings are written to proxy logs, browser history, and `Referer` headers, and a
 `seat_token` is long-lived. Browsers cannot set headers on a WebSocket handshake, so a short-lived
 ticket is the standard way to keep the durable credential out of the URL.
- 
+
 **Consequence.** Clients need one extra round trip before connecting. `arena-client` hides this;
 `web/src/lib/room.ts` must implement it too.
+
+---
+
+## 2026-08-10 — Protocol review triage (15 gaps)
+
+A local adversarial review of PROTOCOL.md v0.1 produced 15 findings (`docs/PROTOCOL_REVIEW.md`).
+Resolution:
+
+**Scoped out.** Gaps 1, 2, 4 — next-hand trigger, room-termination condition, busted-seat
+rotation. All three are multi-hand problems. Declaring "an M1 room plays exactly one hand" (§0.1)
+removes them rather than designing them speculatively. They return in M2 with real requirements.
+
+**Fixed in v0.1.** Gaps 3, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15b–f. See PROTOCOL.md sections
+§0 (serialization), §0.1 (scope), §3 (`None` bounds), §3.0 (uncontested pot), §5/§5.1 (event
+payloads), §6 (`/start`, `/view`, `/actions`, `/result`), §7 (new error codes), §10 (derivation
+table, forced-off features, contract tests).
+
+**Rejected.** Gap 10 — the reviewer recommended enforcing the turn clock from M1. Declined: a
+background timer firing during REST-only contract tests makes them nondeterministic, which fights
+invariant 3. `turn_seconds` is accepted at room creation but inert until M2. Stated explicitly in
+§8 so M1 test-writers do not expect timeouts.
+
+**Two findings worth remembering.**
+
+*Gap 15c* — `min_/max_completion_betting_or_raising_to_amount` return `None`, not a small integer,
+when raising is illegal. §3's original rule (`max_to <= min_to`) would have raised `TypeError` the
+first time a seat could only call. Found by reading pokerkit's source rather than its docs.
+
+*Gap 14* — `seat_timed_out.forced_action` at showdown is computed from hand strength and broadcast
+publicly, proving a seat was beaten before any card is revealed. This leak **does not pass through
+`view()`**, so invariant 2's single chokepoint cannot catch it. General lesson recorded in §5.1:
+before adding a field to a public event, ask what hidden state its *value* is derived from. A
+redaction chokepoint protects serialized state, not derived values.
+
+---
+
+## 2026-08-10 — Origin check and WSS deferred
+
+**Decision.** Cross-Site WebSocket Hijacking protection (`Origin` allowlist at the handshake) and
+enforced WSS are out of scope for the MVP.
+
+**Why.** Not needed for a demo; WebSockets bypass CORS entirely so this is a real gap, but it is
+not on the critical path to a playable table.
+
+**Consequence.** Must be closed before any public deployment. Recorded here so it is a deferral,
+not an oversight.
+
+---
+
+## 2026-08-10 — Third review round: fixes and a real bug
+
+Two further reviews produced ~30 findings. Applied in full except where noted.
+
+**The bug.** §3's `legal_actions` rule said to omit `raise` when `max_to <= min_to`, while the very
+next line described all-in-for-less as a raise with `min_to == max_to` — the first sentence deleted
+exactly the case the second described. A short stack's legal all-in raise would have been missing
+from `legal_actions`. Also corrected: `max_raise_to` is `stacks[i] + bets[i]` (total street
+capacity), not the remaining stack. Verified against pokerkit 0.7.4.
+
+**Self-contradiction that broke the M1 gate.** §0.1 closes a room after one hand; §7 said a closed
+room returns 410. `make hand` reads `/result` right after that hand, so the gate was unsatisfiable
+as written. Reads (`/`, `/view`, `/events`, `/result`) now never 410; only `/start` and `/actions`
+do.
+
+**`ts` vs determinism.** Invariant 3 promised a byte-identical event log while every event carries
+a wall-clock timestamp. Narrowed: identical excluding `ts`, which the room server stamps outside
+the adapter.
+
+**`state.pots` is an iterator.** Deriving `pots[]` and `pot_total` from two reads yields
+inconsistent output. Materialize `tuple(state.pots)` once per construction.
+
+**Odd chips.** `pot_awarded.winners` cannot express a split where one winner gets an extra chip.
+Replaced with `awards: [{seat, amount}]`, which is now authoritative.
+
+**Table talk is not a leak.** A seat saying "I have Ah Kd" is legal poker — speech play, and
+truthfulness is not required. The hidden-information invariant constrains the *server*, not the
+players; narrowed to "hidden information the server derived." Explicitly rejected chat filtering:
+bypassable, false-positive prone, and it would make a secrecy boundary out of something that isn't.
+
+**Canonical event order (§5.0) added.** Determinism is untestable without one. Also separated the
+public event log from the private hand record — the earlier text implied the seed store and the
+transcript were the same thing, which would have leaked the deck.
+
+**`can_win_now(seat)` means less than it sounds.** It compares against already-*exposed* hands, not
+every hidden hand. That happens to be exactly right for the showdown timeout rule — it matches what
+a dealer could determine — but must not be read as "this seat wins."
+
+**Rejected.** `expected_seq` preconditions on actions. With a single per-room queue, a request from
+a seat that is not `to_act` is rejected when it reaches the front; the pre-submission race the
+reviewer describes cannot occur. Not worth the client complexity.
+
+**⚠️ Unresolved — settle by test.** The two reviews disagree on whether PokerKit auto-resolves
+all-in showdowns without `HOLE_CARDS_SHOWING_OR_MUCKING`. §10 now specifies the version that is
+correct either way: explicitly loop `showdown_indices`. An adapter test settles it.
+
+---
+
+## 2026-08-10 — Review is closed
+
+Three review rounds is enough. Further passes go to `tests/contract/`, not to PROTOCOL.md — a spec
+gap that no contract test can express is not a gap worth closing before code exists.
+
+---
+
+## 2026-08-10 — Reduction pass, not an addition pass
+
+Round three left the document self-inconsistent in three places and padded in several more. This
+pass fixed and deleted; it added nothing.
+
+**Contradictions removed.**
+- §10's automation note said to drive show/muck "in whatever order you like," while §3.1 requires
+  `showdown_indices` order exactly. Reveal order changes what later seats know, so it is not a free
+  choice. §10 now defers to §3.1.
+- `/start` returned `seq` in §6 but the `/actions` section claimed it returns `first_seq`/`last_seq`.
+  Now the pair, everywhere.
+- The `showdown` event's `reveals` array did not say how it relates to §3.1's one-event-per-decision
+  rule. Now stated: one entry per discretionary show, all live hands at once in the all-in case.
+
+**Deleted as noise.** Changelog sentences explaining what earlier drafts got wrong ("That was a
+bug") — that history belongs here, not in a spec someone reads to implement from. The timing
+side-channel scope note, which was not actionable at MVP. §5.1's rationale, cut from three
+paragraphs to the rule it exists to state.
+
+**Deduplicated.** `committed_hand` carried two overlapping instructions merged badly; `/result` said
+"never a fresh serialization of `GameState`" twice; there were two separate "Contract tests this
+implies" lists. §5.1 also sat before §5.0.
+
+**Standing principle for this document.** A spec is read to implement from, not to learn the
+project's history from. Rationale earns its place only when it prevents a specific mistake — "why
+`forced_action` is withheld" stays because someone would otherwise add the field back. Everything
+else goes here.
