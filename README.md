@@ -1,4 +1,4 @@
-# Arena
+# Openseat
 
 A browser room where humans and AI model seats play at the same table, joinable by a shared link.
 
