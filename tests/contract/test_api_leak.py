@@ -1,0 +1,193 @@
+"""§4 redaction + §10 leak checklist items, driven over HTTP with the real
+game id (`holdem-nl`). None of this can pass until `packages/game-holdem`
+exists and is wired into the room server's adapter registry — every test
+here fails today at `setup_room`'s first assertion (`400 unknown game`).
+"""
+
+from __future__ import annotations
+
+import json
+import re
+
+import httpx
+import pytest
+
+from tests.contract.conftest import (
+    create_room,
+    events,
+    result,
+    room_summary,
+    setup_room,
+    submit_action,
+    view,
+)
+
+pytestmark = pytest.mark.anyio
+
+_CARD_RE = re.compile(r"\b[2-9TJQKA][cdhs]\b")
+
+
+def _keys(obj: object, found: set[str]) -> None:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            found.add(k)
+            _keys(v, found)
+    elif isinstance(obj, list):
+        for v in obj:
+            _keys(v, found)
+
+
+async def _blob(client: httpx.AsyncClient, room_id: str, seat_tokens: list[str]) -> str:
+    """Everything a set of seats can currently observe: their own views, the
+    public event log, and the error bodies they can provoke by acting when
+    it isn't their turn or by sending a wildly-out-of-range raise."""
+    parts: list[str] = []
+    for tok in seat_tokens:
+        parts.append((await view(client, room_id, tok)).text)
+    parts.append((await events(client, room_id, since=-1)).text)
+    for tok in seat_tokens:
+        bad = await submit_action(client, room_id, tok, {"type": "raise", "to": 10**9})
+        parts.append(bad.text)
+    parts.append((await view(client, room_id, "sea_not-a-real-token")).text)
+    return "\n".join(parts)
+
+
+async def test_no_hole_card_leak_across_any_observable_surface_all_phases_all_seats(
+    client: httpx.AsyncClient,
+) -> None:
+    """§10 checklist, combined: "No deck or card appears in any view, event,
+    or error body before `hand_complete`" + "`text` for seat i contains no
+    card token belonging to any other live, un-mucked seat, at every phase"
+    + "`GET /result` contains no hole card absent from the room's public
+    event log". §4 funnels every redaction decision through one function
+    (`GameAdapter.view`), so a leak anywhere downstream of it — a raw view,
+    the event log, or an error body built from the wrong source — is the
+    same bug wearing a different hat. This test checks the property
+    continuously through every phase of a real hand, not once at the end,
+    because a card that leaks for one street and is then legitimately
+    exposed at showdown must still not have leaked *before* it was exposed.
+    """
+    ctx = await setup_room(client, n_seats=3, config={"sb": 5, "bb": 10, "ante": 0, "starting_stack": 200, "turn_seconds": 30})
+    room_id = ctx["room_id"]
+    seat_tokens: list[str] = ctx["seat_tokens"]
+
+    hole_by_seat: dict[int, list[str]] = {}
+    for seat, tok in enumerate(seat_tokens):
+        v = (await view(client, room_id, tok)).json()
+        hole_by_seat[seat] = v["you"]["hole"]
+        assert hole_by_seat[seat], "test assumes hole cards are already dealt by the time /view is reachable"
+
+    revealed: set[int] = set()
+
+    for _ in range(500):
+        log = (await events(client, room_id, since=-1)).json()["events"]
+        for e in log:
+            if e["type"] == "showdown":
+                for r in e["payload"]["reveals"]:
+                    revealed.add(r["seat"])
+            if e["type"] == "hand_complete":
+                return  # deck disclosure from here on is in-scope for the dedicated deck test, not this one
+
+        blob = await _blob(client, room_id, seat_tokens)
+        for seat, cards in hole_by_seat.items():
+            if seat in revealed:
+                continue
+            for card in cards:
+                assert card not in blob, f"seat {seat}'s hole card {card!r} leaked before that seat was revealed"
+
+        v0 = (await view(client, room_id, seat_tokens[0])).json()
+        to_act = v0["to_act"]
+        if to_act is None:
+            break
+        actor_view = (await view(client, room_id, seat_tokens[to_act])).json()
+        legal_types = {a["type"] for a in actor_view["legal_actions"]}
+        if "check" in legal_types:
+            action = {"type": "check"}
+        elif "call" in legal_types:
+            action = {"type": "call"}
+        elif "show" in legal_types:
+            action = {"type": "show"}
+        elif "muck" in legal_types:
+            action = {"type": "muck"}
+        else:
+            break
+        resp = await submit_action(client, room_id, seat_tokens[to_act], action)
+        assert resp.status_code == 200, resp.text
+    else:
+        raise AssertionError("hand did not reach hand_complete within the iteration budget")
+
+
+async def test_no_deck_or_card_appears_in_any_surface_before_hand_complete(
+    client: httpx.AsyncClient,
+) -> None:
+    """§10: "No deck or card appears in any view, event, or error body before
+    `hand_complete`." Distinct from the combined leak test above: this
+    checks specifically for the full 52-card `deck` payload, which §10 says
+    is disclosed exactly once, in `hand_complete`, and nowhere before it —
+    not even in a malformed-request error body."""
+    ctx = await setup_room(client, n_seats=2)
+    room_id = ctx["room_id"]
+
+    log = (await events(client, room_id, since=-1)).json()["events"]
+    saw_hand_complete = False
+    for e in log:
+        if e["type"] == "hand_complete":
+            saw_hand_complete = True
+            break
+        assert "deck" not in json.dumps(e), f"deck leaked in {e['type']!r} event before hand_complete"
+    assert saw_hand_complete, "hand never completed"
+
+    bad = await submit_action(client, room_id, ctx["seat_tokens"][0], {"type": "raise", "to": -1})
+    assert "deck" not in bad.text
+
+
+async def test_room_seed_never_appears_in_any_client_facing_payload(client: httpx.AsyncClient) -> None:
+    """§10: "`room_seed` never appears in any client-facing payload at any
+    time." Checked structurally (no `seed`/`room_seed` key anywhere in any
+    response), not by string search — the seed's numeric value could
+    coincidentally match an unrelated field like a stack size."""
+    ctx = await setup_room(client, n_seats=2, seed=123456789)
+    room_id = ctx["room_id"]
+
+    surfaces = [
+        (await room_summary(client, room_id)).json(),
+        (await view(client, room_id, ctx["seat_tokens"][0])).json(),
+        (await events(client, room_id, since=-1)).json(),
+    ]
+    room_created = await create_room(client, seats=2)
+    surfaces.append(room_created.json())
+
+    found: set[str] = set()
+    for surface in surfaces:
+        _keys(surface, found)
+    assert "seed" not in found
+    assert "room_seed" not in found
+    assert "master_seed" not in found
+
+
+async def test_result_contains_no_hole_card_absent_from_the_public_event_log(
+    client: httpx.AsyncClient,
+) -> None:
+    """§10: "`GET /result` contains no hole card absent from the room's
+    public event log." `/result` is defined as a mechanical projection of
+    already-public events (§6) — it must never read `state.hole_cards`
+    directly, so any card it reports has to already be sitting in the log
+    it's supposedly projecting."""
+    ctx = await setup_room(client, n_seats=2, config={"sb": 5, "bb": 10, "ante": 0, "starting_stack": 20, "turn_seconds": 30})
+    room_id = ctx["room_id"]
+
+    # shove all-in preflop so both hands go to showdown and get exposed
+    for tok in ctx["seat_tokens"]:
+        actor = (await view(client, room_id, tok)).json()
+        if actor["to_act"] is None:
+            continue
+        max_to = actor["max_raise_to"]
+        resp = await submit_action(client, room_id, tok, {"type": "raise", "to": max_to})
+        if resp.status_code != 200:
+            await submit_action(client, room_id, tok, {"type": "call"})
+
+    log_text = (await events(client, room_id, since=-1)).text
+    res = (await result(client, room_id)).json()
+    cards_in_result = set(_CARD_RE.findall(json.dumps(res)))
+    for card in cards_in_result:
+        assert card in log_text, f"/result exposed {card!r}, which never appeared in the public event log"
