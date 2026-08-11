@@ -240,6 +240,11 @@ in both.** This is what makes REST-first work.
 }
 ```
 
+**Phase:** `waiting` | `preflop` | `flop` | `turn` | `river` | `showdown` | `hand_complete`.
+`waiting` covers the window between room creation and `/start`. `street` (§1) is the betting-round
+subset — `preflop` | `flop` | `turn` | `river` — and is what `board_dealt.street` carries, minus
+`preflop`, which deals no board.
+
 **Seat status:** `active` | `folded` | `all_in` — these are the only values M1 emits.
 `sitting_out` and `busted` are **reserved for M2** and must never appear in an M1 payload; likewise
 the `room_complete` and `seat_left` events. §0.1 scopes M1 to a single hand, so no seat outlives
@@ -278,7 +283,7 @@ false positives, and would make a secrecy boundary out of something that is not 
 | `table_talk` | `{ seat, name, text }` |
 | `showdown` | `{ reveals: [{ seat, hole, rank_class, description }] }` — one entry per discretionary `show`; all live hands at once in the all-in case (§3.1) |
 | `pot_awarded` | `{ pots: [{ index, amount, awards: [{seat, amount}], reason }] }` — `reason` is `"uncontested"` \| `"showdown"`. **`awards` is authoritative**, not a winner list: a split with an odd chip gives winners unequal amounts, which `winners: [seat]` cannot express. Sum of `awards[].amount` equals the pot `amount` exactly. |
-| `hand_complete` | `{ hand_no, stacks: [...], hand_seed }` — seed disclosed only here, see §10 |
+| `hand_complete` | `{ hand_no, stacks: [...], deck }` — the hand's full 52-card shuffle, disclosed only here, see §10 |
 | `seat_timed_out` | `{ seat, forced_action }` — **`forced_action` is omitted for showdown-phase timeouts.** See §5.1. |
 | `room_complete` | `{ final_stacks, ranking }` — **M2 reserved** |
 
@@ -309,11 +314,11 @@ partial transition.
 | Store | Contains | Served by |
 |---|---|---|
 | Public event log (JSONL) | Events exactly as broadcast | `GET /events`, WS `event` frames |
-| Private hand record | `master_seed`, in-progress `hand_seed`, dealt deck | **nothing** — server-side only |
+| Private hand record | `room_seed`, the in-progress deck | **nothing** — server-side only |
 
 "The event log is the transcript" refers to the **public** log. The private hand record is not a
 transcript and is never served. Its per-hand seed is copied into the public `hand_complete` event
-when the hand ends; `master_seed` never is.
+when the hand ends; `room_seed` never is.
 
 ### 5.1 Why `forced_action` is withheld at showdown
 
@@ -524,9 +529,9 @@ class GameAdapter(Protocol):
     max_players: int
     config_schema: dict            # JSON Schema; rendered as the room-creation form
 
-    def reset(self, cfg: dict, seed: int) -> GameState: ...
-        # `seed` is the already-derived PER-HAND seed, never the room's master_seed.
-        # The adapter knows nothing about the room's seeding strategy.
+    def reset(self, cfg: dict, deck: list[str]) -> GameState: ...
+        # The room server draws the shuffle and hands the adapter a full 52-card deck.
+        # The adapter does no shuffling and knows nothing about seeding.
     def legal_actions(self, s: GameState, seat: int) -> list[ActionSpec]: ...
     def apply(self, s: GameState, seat: int, a: Action) -> list[Event]: ...
     def view(self, s: GameState, seat: int) -> Observation: ...   # ONLY redaction point
@@ -605,52 +610,37 @@ assert all(isinstance(c, Card) for c in state.hole_cards[i]), "hole cards not pa
 
 That assertion is cheap and turns a delayed mystery crash into an immediate one.
 
-### Seeding — the seed is a secret during a hand
+### Dealing — one shuffle per hand, and the deck is what gets published
 
-Each hand is dealt from a deck shuffled by a seeded RNG. **This does not make cards predictable:**
-the per-hand seed is drawn from `secrets.randbits(64)`, so every hand is unpredictable. What the
-seed buys is reproducibility — a transcript can be replayed exactly, a bug can be reproduced from
-a saved hand, and the same deck can be re-run against a different model.
+The room holds a single `room_seed` (`secrets.randbits(64)`). At the **start of each hand** the
+room server draws one complete 52-card shuffle from it and passes that deck to
+`GameAdapter.reset(cfg, deck)`. The adapter never shuffles and never sees a seed.
 
-**But an exposed seed is an exposed deck.** Anyone holding the seed and knowing the shuffle can
-compute every hole card at the table. Therefore:
+**Draw a whole shuffle per hand, never card-by-card on demand.** Lazy drawing makes the number of
+RNG calls depend on how the hand played — a hand ending preflop consumes fewer cards than one
+reaching the river — so hand 2's cards would depend on how hand 1 *went*, not just on the seed.
+That breaks the "same deck, different model" comparison outright. A constant number of draws per
+hand keeps hand N's deck fixed regardless of what happened before it.
+
+**The deck is the replay artifact, not the seed.** A seed only reproduces a deck if the identical
+shuffle code runs — same algorithm, same RNG, same Python version. Refactor the shuffle and every
+stored seed silently replays a *different* hand. A stored deck needs no algorithm; it is the
+answer. 52 strings per hand is not worth optimising away.
 
 | | During the hand | After `hand_complete` |
 |---|---|---|
-| `hand_seed` | Server memory + server-side transcript only. **Never** in a view, event, or response body. | Included in the `hand_complete` event |
+| The hand's deck | Private hand record only. **Never** in a view, event, or response body — an exposed deck is every hole card at the table. | Published in the `hand_complete` event |
+| `room_seed` | Server memory only | **Never published.** It generates every hand in the room, including ones not yet dealt. |
 
-- The room holds a `master_seed`; each hand's seed is `derive(master_seed, hand_no)`.
-- `master_seed` is **never** transmitted to any client, ever — not even after the room ends.
-  Revealing it would expose every future hand in that room.
-- `room_created` does **not** carry a seed.
+- `room_created` does **not** carry a seed or a deck.
 - An explicit `seed` may be passed to `POST /rooms` **only when the server runs with
-  `ARENA_ALLOW_FIXED_SEED=1`**, which is off in production. This exists for tests and nothing else.
+  `ARENA_ALLOW_FIXED_SEED=1`**, off in production. This exists for reproducible tests
+  (invariant 3) and nothing else — it is not the replay mechanism.
 
-### Automation
-
-Proposed flags confirmed workable: automate ante posting, blind posting, bet collection, hand
-killing, and chip pushing/pulling. Keep `HOLE_CARDS_SHOWING_OR_MUCKING` manual.
-
-**⚠️ Unresolved between two reviews — settle with a test, do not guess.** The first spike reported
-that all-in showdowns resolve automatically regardless of the flag. A later review found that with
-the flag absent, `showdown_indices` stays populated and `can_show_or_muck_hole_cards()` is true, so
-the caller must drive the operations or the adapter stalls before dealing the remaining board.
-
-Implement the version that is correct either way: **explicitly loop `showdown_indices` and call
-`show_or_muck_hole_cards(True, seat)` for every live all-in seat.** If PokerKit already did it, the
-loop is empty and costs nothing. Add an adapter test asserting the board is fully dealt and every
-live all-in hand is exposed after a 3-way preflop all-in.
-
-Also verify the exact calls that suppress cash-game runout selection; forcing `runout_count = 1` is
-stated below but the mechanism is unconfirmed.
-
-When every contested seat is all-in there is no show/muck *discretion* — but the operations still
-need a caller. Drive them in `showdown_indices` order, always (§3.1).
-
-### Contract tests this implies
-
-- [ ] No seed appears in any view, event, or error body before `hand_complete`; `master_seed`
-      never appears at all; an explicit seed is rejected unless the fixed-seed flag is on
+- [ ] No deck or card appears in any view, event, or error body before `hand_complete`
+- [ ] `room_seed` never appears in any client-facing payload at any time
+- [ ] An explicit seed is rejected unless the fixed-seed flag is on
+- [ ] A hand ending preflop consumes the same number of RNG draws as one reaching the river
 - [ ] Dealt hole cards are `Card` instances, not `str`
 - [ ] `raise to N` moves the actor's stack by `N - bets[i]`, not by `N`
 - [ ] 3-way all-in with unequal stacks produces >1 entry in `pots[]` with correct `eligible_seats`

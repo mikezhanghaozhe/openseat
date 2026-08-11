@@ -246,3 +246,37 @@ implies" lists. §5.1 also sat before §5.0.
 project's history from. Rationale earns its place only when it prevents a specific mistake — "why
 `forced_action` is withheld" stays because someone would otherwise add the field back. Everything
 else goes here.
+
+---
+
+## 2026-08-10 — Replay artifact is the deck, not a seed
+
+**Decision.** Drop `master_seed` and `derive()`. The room holds one `room_seed`; at the start of
+each hand the room server draws one complete 52-card shuffle and passes the deck to
+`GameAdapter.reset(cfg, deck)`. The **deck** is published in `hand_complete`. `room_seed` is never
+published.
+
+**Why.** Two independent reasons, both better than the scheme they replace.
+
+*Robustness.* A seed only reproduces a deck if the identical shuffle code runs — same algorithm,
+same RNG, same Python version. Refactor the shuffle and every stored seed silently replays a
+different hand, with no error to notice. A stored deck doesn't need the algorithm; it is the
+answer. The cost is 52 strings per hand.
+
+*Simplicity.* `derive()` existed solely because publishing hand 3's seed would otherwise leak the
+master and therefore hands 4 through 10. Publishing decks removes the problem rather than solving
+it — hand 4's deck isn't derived from anything that's been disclosed. That deletes a cryptographic
+requirement (HMAC, one-wayness) and a shuffle-algorithm-pinning requirement from the spec.
+
+**Consequence.** `GameAdapter.reset` takes `deck: list[str]` instead of `seed: int`; the adapter
+never shuffles. Seeded RNG survives only as a *testing* tool via `ARENA_ALLOW_FIXED_SEED`
+(invariant 3), not as the replay mechanism.
+
+**One constraint this creates.** Draw a whole shuffle per hand, never card-by-card on demand. Lazy
+drawing makes the number of RNG calls depend on how the hand played, so hand 2's cards would depend
+on how hand 1 *went* — which breaks the "same deck, different model" comparison that is the point
+of replay. Contract test added.
+
+**Credit where due.** This came from the question "couldn't we just store the actual cards?" The
+seed scheme was the conventional answer, not the right one for this project; compactness was never
+a constraint here.
