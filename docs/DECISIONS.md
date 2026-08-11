@@ -280,3 +280,92 @@ of replay. Contract test added.
 **Credit where due.** This came from the question "couldn't we just store the actual cards?" The
 seed scheme was the conventional answer, not the right one for this project; compactness was never
 a constraint here.
+
+---
+
+## 2026-08-11 — room-server: `GameAdapter.reset` can't produce the hand-start events (flag for §9)
+
+**Gap found.** §9's `reset(cfg, deck) -> GameState` returns only state, but §5.0's setup sequence
+needs `hand_started`, game-specific postings (`blinds_posted` for holdem), `hole_cards_dealt`, and
+`action_required` immediately after. `room_created`/`seat_joined` are room-server-generic and don't
+need the adapter; `blinds_posted` content (who posted what) is genuinely game-specific and cannot
+be synthesized from a generic `Observation` — there is no `postings` field in §4.
+
+**Decision (room-server-local, not a PROTOCOL.md change).** Added `GameAdapter.setup_events(state)
+-> list[Event]`, called once immediately after `reset`, to the copy of the `GameAdapter` Protocol
+that lives in `packages/room_server/adapter.py`. It returns the full hand-start sequence with
+placeholder `seq`/`ts`, same convention as `apply`. `StubAdapter` implements it.
+
+**Flagging for the PROTOCOL.md owner.** This is exactly the kind of gap AGENTS.md says to flag
+rather than resolve unilaterally across a package boundary — §9 is frozen and owned by the human.
+Whoever builds `packages/game-holdem` will need this method too, so either §9 gains it formally or
+an equivalent mechanism is specified before that package is built. Interim state: room-server's
+local Protocol copy is a superset of §9, not a divergent one — every method §9 specifies is
+implemented exactly as specified; this is the only addition.
+
+**Related, same root cause.** §9's `reset(cfg, deck)` also has no way to receive the seat count
+(needed by every adapter, not just the stub — a hand can't be dealt without knowing how many
+players are in it). Room-server passes it as a reserved `cfg["_seats"]` key, injected *after*
+config validation against `config_schema` so it never has to appear in the schema itself. Same flag
+applies.
+
+---
+
+## 2026-08-11 — room-server: adapter `view()` doesn't own the whole `Observation`
+
+**Decision.** `GameAdapter.view(state, seat)` is invariant 2's sole redaction chokepoint, but four
+fields it returns are overwritten by the room server before the response goes out:
+`protocol_version`, `seq`, `room_id` (server-owned envelope, the adapter has no way to know any of
+them), and seat `name`/`kind` on `you` and every entry in `seats[]` (join-time metadata owned by
+the room server's seat registry, not visible to the adapter). `chat` is similarly built by the room
+server from its own event log, not returned meaningfully by the adapter.
+
+**Why this doesn't violate invariant 2.** The adapter still owns every field where redaction
+judgment is actually exercised — hole cards, stacks, pots, legal actions, status, `to_call`/raise
+bounds. The overlay only ever replaces fields that carry zero hidden information and that the
+adapter structurally cannot populate (it never receives room/seat identity, only a bare seat
+index). No new serialization path is opened; the overlay works purely by
+`dataclasses.replace` on the adapter's own return value.
+
+**Consequence for `packages/game-holdem`.** Its `view()` can return `""`/`0`/placeholder
+name+kind for those overlaid fields — the room server will overwrite them on every call. Documented
+in `adapter.py`'s docstring so this isn't rediscovered per-adapter.
+
+---
+
+## 2026-08-11 — room-server: idempotency replay is checked before the closed/turn gates
+
+**Decision.** `POST /actions`' `(room_id, seat, request_id)` lookup happens first, ahead of the
+`room_closed` and `not_your_turn` checks — not after them.
+
+**Why.** §6 says idempotent replay exists so a dropped response doesn't turn into a double action;
+that has to include the response to the action that *closes* the room (e.g. the fold that ends the
+only hand in M1). Checking `closed` first meant a client retrying its own closing action's
+`request_id` — because it never saw the first response — got `410 room_closed` instead of its
+original result, defeating the point of idempotency for the single most likely case of a dropped
+response (the room closing is exactly when a client is most likely to be racing a reconnect).
+Caught by an end-to-end curl smoke test before any contract test ran, not by mypy or ruff — this
+class of bug lives entirely in request ordering.
+
+**Consequence.** A genuinely new `request_id` still hits `room_closed`/`not_your_turn` exactly as
+before; only a replay of an already-reserved id bypasses them. Test:
+`test_idempotent_replay_survives_room_close` in `tests/unit/test_room_server.py`.
+
+---
+
+## 2026-08-11 — room-server: `GET /events?since=N` is exclusive, not inclusive
+
+**Decision.** `/events?since=N` returns events with `seq > N`, matching the WebSocket `resume.since`
+semantics in §8 exactly (both mean "I already have up to and including `since`").
+
+**Why.** §6 says a polling client "passes `since=last_seq` ... and knows it has seen every
+consequence of its own request" — i.e. it already has everything through `last_seq` and wants only
+what comes *after*. That only makes sense under exclusive semantics; inclusive would re-serve events
+the client already has. This makes `/events?since=0` (shown as the illustrative example in §6)
+skip the very first event, `seq=0` — a real oddity, but a documented and intentional one. A client
+that wants the full log from the start passes a `since` below the first `seq` (any negative
+number works, since `seq` starts at 0).
+
+**Flagging for the PROTOCOL.md owner.** §6's own example (`?since=0`) reads as if it means "give me
+everything," which is the inclusive interpretation — that's the ambiguity being resolved here.
+Worth a one-line clarification in §6 itself.
