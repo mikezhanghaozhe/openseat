@@ -369,3 +369,329 @@ number works, since `seq` starts at 0).
 **Flagging for the PROTOCOL.md owner.** §6's own example (`?since=0`) reads as if it means "give me
 everything," which is the inclusive interpretation — that's the ambiguity being resolved here.
 Worth a one-line clarification in §6 itself.
+
+---
+
+## 2026-08-11 — game-holdem: the §10 all-in/showdown ambiguity, settled by test
+
+**Decision.** §10 flagged a real disagreement between two protocol reviews about whether pokerkit
+auto-resolves an all-in showdown without `Automation.HOLE_CARDS_SHOWING_OR_MUCKING` enabled. Settled
+empirically against pokerkit 0.7.4, not by reading its docs: it does **not**. With that automation
+(and `HOLE_DEALING`/`BOARD_DEALING`) excluded, `state.showdown_indices` sits populated and
+`can_deal_board()` stays `False` until every seat in it has been explicitly shown or mucked —
+nothing advances on its own.
+
+**The real operation order, verified by stepping through pokerkit's source
+(`_end_bet_collection`/`_begin_showdown`/`_end_showdown`), is also not what the two-review
+disagreement assumed.** For an all-in hand, showdown reveals happen **before** the remaining board
+is dealt, one street's worth of dealing at a time, cycling `showdown → deal → showdown(empty) →
+deal → …` until the last street, only then falling into hand-killing. It is not "deal the whole
+board, then reveal everyone." `_advance` in `adapter.py` mirrors this exactly (`can_deal_board()`
+checked first each loop iteration, `showdown_indices` second) because that is the order pokerkit
+actually requires, not the more intuitive TV-broadcast order.
+
+**Consequence.** The wire event order this produces (`showdown` bundling all reveals happens right
+before the final `board_dealt`+`pot_awarded`+`hand_complete`, even though pokerkit resolved the
+*reveal itself* earlier, before most of the board was dealt) is a deliberate choice: `_finalize`
+defers constructing the wire `showdown` event until the board is fully known, since hand
+rank/description needs it — see the next entry for why that deferral turned out to be load-bearing
+for a different reason. §5.0 doesn't pin down board-dealt-vs-showdown ordering for the pure all-in
+case (only for the discretionary one), so this is within the protocol's freedom, not a deviation
+from it.
+
+---
+
+## 2026-08-11 — game-holdem: three real bugs found only by driving real hands, not by mypy
+
+`mypy --strict` and `ruff` were clean the entire time these existed. All three were caught by
+running actual hands through the adapter and checking the money added up — the discipline AGENTS.md
+asks for ("no swallowed errors," "raise rather than silently correct") doesn't help when the bug is
+in trusting a library's return value that looks reasonable but means something narrower than it
+appears to.
+
+**Bug 1 — `Pot` is a mutable dataclass; `tuple(state.pots)` doesn't protect you from that.**
+`push_chips()` decrements `pot.unraked_amount` on the *same object* as it distributes each sub-pot.
+Capturing `pots_before = tuple(pk.pots)` before pushing looks like a snapshot, but a tuple only
+freezes which objects it holds, not their contents — by the time `PotAward.amount` was read from
+it, every pot showed `0`. Fix: extract plain ints (`[p.amount for p in tuple(pk.pots)]`) immediately,
+before any `push_chips()` call. The two-fold trap here: §10 already warns that `state.pots` is an
+*iterator* that must be materialized once — true, but materializing it isn't enough on its own,
+because what you materialize is still a list of objects the engine keeps mutating.
+
+**Bug 2 — `state.pots` (and hence `pot_total`) is `()` for an entire betting round until it
+closes.** Confirmed empirically: right after blinds are posted, before any voluntary action,
+`tuple(state.pots)` is empty even though 75 chips are sitting on the table. `state.bets[i]` holds
+the current street's uncollected commitments separately, swept into `pots` only at bet collection.
+`Observation.pot_total`/`pots[]` must add `sum(state.bets)` on top of `state.pots` or it silently
+under-reports for most of a hand — the §4 example's `pot_total: 450` implies "everything in the
+middle right now," which `state.pots` alone does not give you.
+
+**Bug 3 — `Automation.HAND_KILLING` destroys a losing hand's hole cards before you can report
+them, and this only shows up in a 3-way-or-more all-in.** `kill_hand()` → `_muck_hole_cards()` calls
+`self.hole_cards[player_index].clear()` on every seat that `can_win_now()` says can't win, as
+ordinary end-of-hand cleanup — real-life poker dealer behavior, modeled faithfully, but it means
+that by the time `_finalize()` runs (after the board is fully dealt, which is required to know who
+lost), the losing seats' `state.hole_cards` are already empty lists. `state.get_up_hands()` then
+returns `None` for them — not stale data, a clean `None`, which reads exactly like "this seat's
+hand was never evaluable" rather than "this seat's hand was deleted after being evaluated." A
+heads-up hand never exposes this (only one seat can lose, and the winner's own cards are never
+killed, so `hole=[...]` for the single loser still happened to be captured earlier in the code as
+written) — it takes 3+ seats going all-in together to reveal it, which is exactly the scenario the
+critical §10 test in the previous entry exercises.
+
+**Fix.** Stopped depending on `state.get_up_hands()` and `state.hole_cards` for reveal construction
+entirely. Each all-in-revealed seat's hole cards are captured into
+`GameState.pending_all_in_reveals` (a `dict[seat, hole_cards]`) *at the moment* `show_or_muck_hole_cards(True, seat)`
+is called — before hand-killing gets anywhere near it — and hand strength is computed later, once
+the board is final, via `StandardHighHand.from_game(hole, board)`: a standalone evaluator that takes
+cards directly and has no dependency on `State`'s internal bookkeeping (or its side effects) at all.
+The discretionary (non-all-in) show path was changed the same way for consistency, even though it
+wasn't independently broken (its `_reveal` call already happened before `_advance()` could trigger
+hand-killing).
+
+**How this was caught.** Not a design review — a deliberate decision (documented in AGENTS.md's own
+workflow guidance and repeated in this task's instructions) to smoke-test the adapter with real
+multi-seat hands, across many random seeds, checking `sum(awards) == pot.amount` and
+`sum(results.values()) == 0`, before writing a single formal test. The first 3-way all-in tried
+threw `AssertionError: no evaluable hand for seat N` immediately. A type checker cannot catch "this
+library method returns `None` for a reason that isn't the one you assumed" — only running the code
+can.
+
+---
+
+## 2026-08-11 — game-holdem: button is seat (n-1), not seat 0
+
+**Decision.** `GameState.button = seats_total - 1`, derived directly from how pokerkit assigns
+blind postings to seat indices — not hardcoded to `0`.
+
+**Why.** Verified empirically: for 3+ players, `raw_blinds_or_straddles=(sb, bb)` passed
+positionally lands `sb` on seat index `0` and `bb` on seat index `1`, with the first voluntary
+actor at seat `n-1` (UTG in a 3-handed hand is the button, since after BB the action returns to the
+button before wrapping to SB) — i.e. button = `n-1`. Heads-up is the interesting case: pokerkit
+*reverses* the blind assignment there (seat `0` gets `bb`, seat `1` gets `sb`) to match the
+standard rule that the button posts the small blind heads-up — and seat `1` is still `n-1`. The
+formula holds for every player count without a special case, which is why it's trusted rather than
+patched around.
+
+**Consequence for §4's `button: 0` example.** That's an illustrative value from one example hand,
+not a requirement — nothing in PROTOCOL.md pins the button to a specific seat, and M1 never rotates
+it (§0.1, one hand per room), so reporting pokerkit's own natural convention honestly is simpler and
+less error-prone than remapping seat indices to force button on seat 0.
+
+---
+
+## 2026-08-11 — game-holdem: uncontested-fold `pot_awarded.amount` is the full pot, not pokerkit's
+
+**Decision.** When a hand ends by everyone-but-one folding, `PotAward.amount`/`awards[]` reports
+the seat's **entire winnings** (both blinds, e.g. `75`), computed directly from `sum(pot amounts) +
+sum(state.bets)` at that moment — not from `push_chips()`'s returned `ChipsPushing.amounts`, which
+for this one specific case (`sum(state.statuses) == 1`, pokerkit's fast path for "only one player
+left, nothing to compare") only reports the *net transfer* (`25`, excluding the winner's own
+last bet, which just gets swept back to them via `pull_chips()` instead of being formally
+"pushed").
+
+**Why.** Both numbers are internally self-consistent on their own terms (`sum(awards) ==
+pot.amount` holds either way) — the choice is about which one matches what the client already saw.
+`Observation.pot_total` shows `75` throughout the hand (see the pot_total bug two entries up); if
+`pot_awarded` then reported `25`, a client watching the hand would see the pot shrink by two-thirds
+at the exact moment it's "awarded," with no event explaining where the other `50` went. Reporting
+the full amount keeps `pot_total` and `pot_awarded.amount` consistent across the one transition
+where a client would notice if they weren't.
+
+**Scope.** This special-case only applies when `not hand_had_showdown` (the uncontested path,
+exactly one pot, exactly one winner by construction — no side-pot splitting question can even arise
+here). A genuine multi-way showdown never hits this shortcut in pokerkit — verified against a 3-way
+all-in, where `push_chips()`'s reported amounts already summed to the true full pot with no
+adjustment needed — so the showdown path trusts pokerkit's own accounting unmodified.
+
+---
+
+## 2026-08-11 — game-holdem: a genuine side pot cannot occur in any M1 hand
+
+**Finding, not a decision — recorded because it constrains what's testable and because a future
+agent could reasonably expect otherwise.** §6's `POST /rooms` config carries exactly one
+`starting_stack` for the whole room. Every seat's *total capacity for the hand* is
+`stack[i] + bets[i]`, which stays equal to that one shared `starting_stack` for every seat, for the
+entire hand, right up until someone's chips actually leave the table — which only happens at
+`hand_complete`, by definition the end. Side pots require unequal maximum contributions among
+contesting seats; with a uniform `starting_stack` and only one hand ever played per room (§0.1),
+that inequality can never arise, regardless of bet sizing or street. Confirmed by trying: a
+plausible-looking construction (small flop raise from two seats, all-in raise from a third) still
+produces exactly one pot, because the two "smaller" bettors' *ceiling* was never actually lower —
+they simply hadn't yet chosen to commit the rest of their equally-sized stack.
+
+**Consequence for testing.** `test_3way_unequal_stacks_produce_more_than_one_pot_with_correct_eligibility`
+in `tests/unit/test_game_holdem.py` builds a `GameState` directly with `NoLimitTexasHoldem.create_state`
+and per-seat stacks, bypassing `HoldemAdapter.reset()` (which only accepts the single uniform
+value), specifically because the room-server's actual config path cannot reach this scenario. The
+adapter's pot-splitting *logic* is still real production code being tested — only the room-shaped
+entry point is bypassed, to reach a state §6's config can't construct in M1.
+
+**Where this actually matters.** M2's multi-hand rooms are exactly what makes stacks diverge (a
+player wins or loses a previous hand, then a later hand's all-in has real inequality) — this
+isn't a defect to fix now, just scope worth naming so nobody spends M1 time chasing a side-pot bug
+report that can't reproduce from a fresh room.
+
+---
+
+## 2026-08-11 — game-holdem: `Automation.RUNOUT_COUNT_SELECTION` is unnecessary, not just unused
+
+**Decision.** Omitted entirely from `_AUTOMATIONS`, rather than included-but-forced-to-1.
+
+**Why.** `create_state` defaults to `mode=Mode.TOURNAMENT` (used explicitly here, not left implicit,
+for documentation), and `State._begin_showdown` only ever offers runout-count selection when
+`mode != Mode.TOURNAMENT`. In tournament mode, `can_select_runout_count()` is `False` for the entire
+hand — there is nothing for the automation to do, and `state.runout_count` simply never gets set to
+anything other than its default. §10's "force runout_count to 1" requirement is satisfied
+structurally by the mode choice, not by an automation that would otherwise need to reject a
+selection request that tournament mode never lets a caller make in the first place.
+
+---
+
+## 2026-08-11 — game-holdem: pokerkit's own internal `deck_cards` is inert here, and warns about it
+
+**Not a bug, recorded so a future agent doesn't chase it as one.** `NoLimitTexasHoldem.create_state`
+builds its own internally-ordered `state.deck_cards` (52 cards) regardless of what's passed to it —
+there is no parameter to suppress this. Since `HOLE_DEALING`/`BOARD_DEALING` are excluded from
+`_AUTOMATIONS` and every card dealt here comes from an explicit string built from the room server's
+seeded shuffle (`cards.deal_hole`/`cards.deal_board`), `state.deck_cards` is never read from — but
+pokerkit still checks each explicitly-dealt card against it and emits `UserWarning: A card being
+dealt ... is not recommended to be dealt` whenever it doesn't match pokerkit's own unused internal
+ordering, which is effectively always. Confirmed harmless: every money/card invariant checked across
+30+ random-seed hands holds regardless. Left unsuppressed deliberately — silencing warnings globally
+here risks hiding a real future one.
+
+---
+
+## 2026-08-12 — arena-client: sync HTTP, not async
+
+**Decision.** `RoomClient` wraps a plain `httpx.Client`, not `httpx.AsyncClient`.
+
+**Why.** M1 is REST-only and every call is a single request/response with no need to hold a
+connection open (§8: WebSocket, where concurrency actually matters, arrives in M2). `scripts/
+play_hand.py` — this package's own primary consumer today — is a straight-line script; async would
+buy it nothing but a `asyncio.run` wrapper. `httpx.MockTransport` and `httpx.Client`/`AsyncClient`
+share the same transport interface, so nothing about today's tests or wire logic would need to
+change to add an async variant later.
+
+**Consequence.** M3 (model seats) and M5 (MCP bridge) may want concurrent seats/tools and will
+likely want an async client. Deferred rather than guessed at now — building both today would mean
+maintaining two request/response/parse paths for a need that isn't concrete yet. Flagging this
+explicitly so M3/M5 doesn't assume async support exists.
+
+---
+
+## 2026-08-12 — arena-client: explicit per-type parsers, not a generic decoder
+
+**Decision.** `parse.py` is ~15 small functions (`parse_observation`, `parse_event`, one per
+`Payload` member, …), each naming its fields explicitly, rather than one reflective
+dict-to-dataclass walker driven by `dataclasses.fields()`.
+
+**Why.** This is the reverse operation of `packages/room_server/serialize.py`'s `to_wire` (which
+*is* generic, because every dataclass follows one rule: omit `None`). Decoding doesn't have that
+luxury — a generic decoder still needs to know, per field, which enum to construct, which nested
+type to recurse into, and which `EventType` maps to which `Payload` member. That dispatch table
+ends up exactly as long as these explicit functions, just written once as data instead of code, and
+loses `mypy --strict`'s ability to check each field access against the real dataclass signature.
+Explicit functions cost more lines; they cost zero `Any`.
+
+---
+
+## 2026-08-12 — arena-client: only two dedicated exception subclasses
+
+**Decision.** `IllegalActionError` and `RequestIdConflictError` are the only `ArenaApiError`
+subclasses. The other nine §7 error codes (`invalid_token`, `not_your_turn`, `room_not_found`,
+`seats_not_filled`, `seat_taken`, `room_full`, `hand_in_progress`, `room_closed`, `rate_limited`)
+all raise the base `ArenaApiError` directly, distinguishable via `.error`.
+
+**Why.** The task names exactly one required behavioral difference — "on 409 illegal_action, do not
+blindly retry; re-read legal_actions and surface it" — and request_id_conflict has an equally sharp
+shape (retrying with the same id can never succeed; it's a caller bug, not a transient failure).
+Every other code is informational to the caller in the same way: "here's what went wrong, here's
+the reason." A dedicated class per code would be nine near-empty subclasses adding ceremony without
+adding a behavioral distinction anyone's been asked to make yet.
+
+---
+
+## 2026-08-12 — arena-client: `_request` treats a non-JSON error body as recoverable, not fatal
+
+**Bug, found by a test, not by writing it defensively up front.**
+`test_malformed_error_body_still_raises_a_usable_error` (constructed to simulate a raw-text 500 —
+the kind an upstream proxy or a crashed process produces, not our own JSON error shape) crashed
+with an unhandled `json.JSONDecodeError` from inside `response.json()`, before `_request` ever got
+the chance to build an `ArenaApiError`. The fix: `_request` now catches the decode failure and falls
+back to `{"reason": response.text}`, so every non-2xx response — ours or not — raises the same
+`ArenaApiError` type. This was the one test in the suite written from "what could actually go wrong
+against a real network," not from the wire spec directly, and it's the one that caught something.
+
+---
+
+## 2026-08-12 — scripts/play_hand.sh starts its own wired server; `make dev` still doesn't have holdem-nl
+
+**Decision.** `scripts/_serve_holdem.py` builds its own app via
+`packages.room_server.main.create_app(adapters={"holdem-nl": HoldemAdapter()})` and runs it with
+`uvicorn.run(...)` directly, rather than `play_hand.sh` shelling out to `uvicorn
+packages.room_server.main:app` (`make dev`'s command).
+
+**Why.** `packages/room_server/main.py`'s module-level `app` — what `make dev` actually serves —
+registers only `StubAdapter` in its adapter registry (`packages/room_server/adapter.py`'s own
+`create_app` default). That's correct and expected: `room_server` was built and is owned
+independently of `game-holdem`, has no reason to import it, and `create_app(adapters=...)` exists
+specifically as the seam for exactly this kind of external wiring. Discovered by trying to run
+`play_hand.sh` against a server started the `make dev` way first — every room creation failed with
+`400 bad_request: unknown game 'holdem-nl'`, correctly, because the real game genuinely isn't
+registered there.
+
+**Consequence — flagging, not fixing.** `make dev`'s server still can't play a real hand of poker
+today; only `scripts/_serve_holdem.py`'s instance can. This isn't a bug in room_server (it's doing
+exactly what it says), but it does mean the two milestones' pieces aren't wired together anywhere
+except here, and only for the duration of this one script's run. Worth a real decision — likely
+`room_server` growing an adapter-registry entry point read from config or an env var, once
+`game-holdem`'s ownership settles — rather than staying implicit in a script under `scripts/`.
+`scripts/_serve_holdem.py` uses `room_server`'s own public extension point and edits nothing under
+`packages/room_server/`, so it stays inside this task's ownership boundary while still producing a
+genuinely runnable end-to-end gate.
+
+---
+
+## 2026-08-12 — a real game-holdem bug found via play_hand.sh, reverted rather than fixed here
+
+**Not fixed in this session, on purpose — flagging per AGENTS.md's own rule ("if your task needs a
+change in someone else's package, stop and flag it — do not reach across"), even though the fix was
+already written, verified, and then deliberately reverted to respect the ownership boundary
+(`packages/arena-client/` and `scripts/play_hand.sh` only).**
+
+**The bug.** In `packages/game_holdem/adapter.py`'s `_apply_showdown_decision`, hole cards for a
+`show` decision are captured via `[repr(c) for c in s.pk.hole_cards[seat]]` **after** calling
+`s.pk.show_or_muck_hole_cards(show, seat)`. For every showdown decision except the *last* one
+pending, that's fine. For the last one, `show_or_muck_hole_cards` itself cascades synchronously
+through pokerkit's internal `_end_showdown` → `_begin_hand_killing` chain before returning (
+`Automation.HAND_KILLING` is enabled) — the exact same class of bug already documented in this file
+under "game-holdem: three real bugs found only by driving real hands" for the *all-in* reveal path,
+just reachable one call earlier than that entry accounts for. If the last-to-show seat turns out to
+hold a losing hand, hand-killing clears `state.hole_cards[seat]` before the capture line runs, and
+the `showdown` event — and therefore `/result`'s `showdown[]`, which is a faithful projection of
+that same event, correctly per §6 — reports `hole: []` for a seat that explicitly chose to show.
+
+**How it was found.** Not by a game-holdem unit test — none of the 21 tests in
+`tests/unit/test_game_holdem.py` happen to reach a *discretionary* (non-all-in) showdown with 3+
+seats where the last-to-decide seat both shows and loses; the closest existing test is heads-up,
+where the second-to-act seat mucks rather than shows, so the affected code path is never exercised.
+It surfaced immediately in a real 4-seat run through `scripts/play_hand.sh` — three of four seats
+showed correct hole cards, the fourth (last to act) came back empty every time the scenario was
+close to reproduced.
+
+**The fix, for whoever owns `packages/game_holdem/` next.** Move the hole-card capture line above
+the `show_or_muck_hole_cards` call, matching the pattern already used in `_advance`'s all-in branch
+(`packages/game_holdem/adapter.py`, the `if pk.all_in_status:` branch) — capture unconditionally
+before the call, then only build the `Reveal` from it if `show` is `True`. Verified as the complete
+fix: reapplying it and rerunning `scripts/play_hand.sh` three times produced correct, non-empty hole
+cards for every seat in every run.
+
+**Consequence for this task.** `scripts/play_hand.py` does not additionally assert on hole-card
+contents in `/result` — it wasn't written to catch this specific bug, and adding an assertion
+narrowly tuned to a bug already found and handed off would be scope creep for a gate script whose
+job is "did the hand complete over HTTP." The gate still exits 0 with this bug present, since
+nothing about it produces an unexpected HTTP status; it's a data-correctness issue, not a
+protocol-conformance one, which is exactly why it needed a real end-to-end run to surface instead
+of a contract test.
