@@ -772,19 +772,31 @@ with no arguments, and every test that imports `packages.room_server.main.app` d
 real game. This is the change flagged as future work in the "scripts/play_hand.sh starts its own
 wired server" entry above — done now, not deferred.
 
-**Eleven contract-test bugs found, not fixed — flagged per AGENTS.md ("if a contract test looks
-wrong, stop and say so rather than editing it").** All eleven are test-authoring mistakes, confirmed
-by direct reproduction against the real system, none are adapter or room-server bugs:
+**Eleven contract-test bugs found. Six fixed after explicit user authorization scoped to exactly
+one class of change; five flagged, not fixed — per AGENTS.md ("if a contract test looks wrong, stop
+and say so rather than editing it").** All eleven are test-authoring mistakes, confirmed by direct
+reproduction against the real system, none are adapter or room-server bugs:
 
 - *Six* API tests (`test_repeating_request_id_with_different_action_returns_409_conflict`,
   `test_retrying_request_id_with_different_table_talk_does_not_conflict`,
   `test_illegal_action_does_not_reserve_its_request_id`,
   `test_actions_response_last_seq_equals_highest_seq_it_emitted`,
   `test_result_returns_200_after_close_and_409_before_hand_complete`,
-  `test_canonical_setup_and_action_event_order_matches_protocol`) hardcode `seat_tokens[0]` as the
+  `test_canonical_setup_and_action_event_order_matches_protocol`) hardcoded `seat_tokens[0]` as the
   first actor. In heads-up hold'em the button/small blind (seat 1 in a 2-seat room, per the
-  "button is seat (n-1)" entry above) acts first preflop, not seat 0 — every one of these fails with
-  `403 not_your_turn` at the first action, confirmed by direct reproduction.
+  "button is seat (n-1)" entry above) acts first preflop, not seat 0 — every one of these failed
+  with `403 not_your_turn` at the first action, confirmed by direct reproduction. **Fixed**: the
+  user explicitly authorized this one specific class of change ("if the only changes you need is to
+  replace hardcoded seat_tokens[0] to be flexible"). Added one local helper,
+  `_first_to_act_token(client, room_id, seat_tokens)`, to `test_api_contract.py` — it reads `to_act`
+  from any seat's `/view` (a pure read, available regardless of whose turn it is) and returns that
+  seat's token — and replaced every `seat_tokens[0]` used as an acting token with it, consistently
+  within each test (both the first and any retried/conflicting call use the *same* resolved token,
+  since idempotency identity includes the seat — see §6). No assertion, scenario, or expected
+  outcome in any of the six tests changed; only which token submits the action did. All 15 tests in
+  `test_api_contract.py` pass now. `test_no_m1_payload_contains_m2_reserved_fields`, which has the
+  identical `seat_tokens[0]` pattern, was already passing before this fix and needed no change — it
+  never asserts on the fold's status code, so it happened to be robust to the bug.
 - *Two* adapter tests reach for a side pot or a "no legal raise" scenario using `_cfg(3,
   starting_stack=...)` — a uniform `starting_stack`, which the "a genuine side pot cannot occur in
   any M1 hand" entry above already proves can never produce either scenario. Not a new finding, the

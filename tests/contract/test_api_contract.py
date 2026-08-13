@@ -26,6 +26,19 @@ from tests.contract.conftest import (
 pytestmark = pytest.mark.anyio
 
 
+async def _first_to_act_token(client: httpx.AsyncClient, room_id: str, seat_tokens: list[str]) -> str:
+    """The seat holding `seat_tokens[0]` is not necessarily first to act —
+    in heads-up hold'em the button/small blind (seat index n-1, i.e. seat 1
+    in a 2-seat room) acts first preflop, not seat 0 (docs/DECISIONS.md,
+    "button is seat (n-1)"). `GET /view` is a pure read available to any
+    claimed seat regardless of whose turn it is, so any token in
+    `seat_tokens` can be used to look up the real `to_act` seat."""
+    obs = (await view(client, room_id, seat_tokens[0])).json()
+    to_act = obs["to_act"]
+    assert to_act is not None, "expected a seat to be to_act right after /start"
+    return seat_tokens[to_act]
+
+
 # -- §10: GET /view token discipline -----------------------------------------
 
 
@@ -68,10 +81,11 @@ async def test_repeating_request_id_with_different_action_returns_409_conflict(
     request_id_conflict." — §6/§7."""
     ctx = await setup_room(client, n_seats=2)
     room_id, seat_tokens = ctx["room_id"], ctx["seat_tokens"]
+    actor_token = await _first_to_act_token(client, room_id, seat_tokens)
     request_id = rid()
-    first = await submit_action(client, room_id, seat_tokens[0], {"type": "call"}, request_id=request_id)
+    first = await submit_action(client, room_id, actor_token, {"type": "call"}, request_id=request_id)
     assert first.status_code == 200, first.text
-    second = await submit_action(client, room_id, seat_tokens[0], {"type": "fold"}, request_id=request_id)
+    second = await submit_action(client, room_id, actor_token, {"type": "fold"}, request_id=request_id)
     assert second.status_code == 409
     assert second.json()["error"] == "request_id_conflict"
 
@@ -85,13 +99,14 @@ async def test_retrying_request_id_with_different_table_talk_does_not_conflict(
     excluded (§6)."""
     ctx = await setup_room(client, n_seats=2)
     room_id, seat_tokens = ctx["room_id"], ctx["seat_tokens"]
+    actor_token = await _first_to_act_token(client, room_id, seat_tokens)
     request_id = rid()
     first = await submit_action(
-        client, room_id, seat_tokens[0], {"type": "call"}, request_id=request_id, table_talk="hi"
+        client, room_id, actor_token, {"type": "call"}, request_id=request_id, table_talk="hi"
     )
     assert first.status_code == 200, first.text
     second = await submit_action(
-        client, room_id, seat_tokens[0], {"type": "call"}, request_id=request_id, table_talk="bye"
+        client, room_id, actor_token, {"type": "call"}, request_id=request_id, table_talk="bye"
     )
     assert second.status_code == 200
     assert second.json().get("replayed") is True
@@ -104,13 +119,14 @@ async def test_illegal_action_does_not_reserve_its_request_id(client: httpx.Asyn
     wrong-turn, and illegal requests reserve nothing")."""
     ctx = await setup_room(client, n_seats=2)
     room_id, seat_tokens = ctx["room_id"], ctx["seat_tokens"]
+    actor_token = await _first_to_act_token(client, room_id, seat_tokens)
     request_id = rid()
     bad = await submit_action(
-        client, room_id, seat_tokens[0], {"type": "raise", "to": -50}, request_id=request_id
+        client, room_id, actor_token, {"type": "raise", "to": -50}, request_id=request_id
     )
     assert bad.status_code == 409
     assert bad.json()["error"] == "illegal_action"
-    good = await submit_action(client, room_id, seat_tokens[0], {"type": "call"}, request_id=request_id)
+    good = await submit_action(client, room_id, actor_token, {"type": "call"}, request_id=request_id)
     assert good.status_code == 200
     assert "replayed" not in good.json()
 
@@ -120,7 +136,8 @@ async def test_actions_response_last_seq_equals_highest_seq_it_emitted(client: h
     request emitted."""
     ctx = await setup_room(client, n_seats=2)
     room_id, seat_tokens = ctx["room_id"], ctx["seat_tokens"]
-    resp = await submit_action(client, room_id, seat_tokens[0], {"type": "call"})
+    actor_token = await _first_to_act_token(client, room_id, seat_tokens)
+    resp = await submit_action(client, room_id, actor_token, {"type": "call"})
     assert resp.status_code == 200, resp.text
     body = resp.json()
     log = (await events(client, room_id, since=body["first_seq"] - 1)).json()["events"]
@@ -168,7 +185,8 @@ async def test_result_returns_200_after_close_and_409_before_hand_complete(
     assert before.status_code == 409
     assert before.json()["error"] == "hand_in_progress"
 
-    fold = await submit_action(client, room_id, seat_tokens[0], {"type": "fold"})
+    actor_token = await _first_to_act_token(client, room_id, seat_tokens)
+    fold = await submit_action(client, room_id, actor_token, {"type": "fold"})
     assert fold.status_code == 200, fold.text
 
     after = await result(client, room_id)
@@ -317,7 +335,8 @@ async def test_canonical_setup_and_action_event_order_matches_protocol(client: h
     ]
     assert [e["seq"] for e in log] == list(range(len(log)))
 
-    resp = await submit_action(client, room_id, seat_tokens[0], {"type": "fold"})
+    actor_token = await _first_to_act_token(client, room_id, seat_tokens)
+    resp = await submit_action(client, room_id, actor_token, {"type": "fold"})
     assert resp.status_code == 200, resp.text
     caused = (await events(client, room_id, since=resp.json()["first_seq"] - 1)).json()["events"]
     caused = [e for e in caused if e["seq"] <= resp.json()["last_seq"]]
