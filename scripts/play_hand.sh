@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # M1 gate (docs/MILESTONES.md): drives 4 seats to showdown through HTTP
-# only. Starts its own server instance (packages: room_server + game_holdem
-# wired together, see scripts/_serve_holdem.py — NOT `make dev`'s stub-only
-# app) for the duration of the run, then tears it down unconditionally.
+# only. Starts its own server instance for the duration of the run (the
+# same app `make dev` serves — packages.room_server.main:app now registers
+# the real holdem-nl adapter by default, see docs/DECISIONS.md, "M1 gate
+# verification pass" — this used to need its own wiring script, no longer
+# does), then tears it down unconditionally.
 #
 # Exits non-zero on any unexpected status: a failure to start the server,
 # a failure to reach it, or scripts/play_hand.py's own non-zero exit all
@@ -37,7 +39,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "starting room server on ${BASE_URL} ..."
-"$PYTHON" "$REPO_ROOT/scripts/_serve_holdem.py" "$PORT" >"$SERVER_LOG" 2>&1 &
+"$PYTHON" -m uvicorn packages.room_server.main:app --host 127.0.0.1 --port "$PORT" --log-level warning >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
 READY=""

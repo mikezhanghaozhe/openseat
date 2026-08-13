@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from pokerkit import Automation, Mode, NoLimitTexasHoldem, StandardHighHand, State
+from pokerkit import Automation, Mode, NoLimitTexasHoldem, Pot, StandardHighHand, State
 
 from packages.engine.types import (
     Action,
@@ -90,11 +90,79 @@ class GameState:
     # seat -> hole cards, captured immediately at show time (see _build_reveal).
     pending_all_in_reveals: dict[int, list[str]] = field(default_factory=dict)
     hand_had_showdown: bool = False
+    # Pre-drain snapshot, populated by _finalize before any push_chips()
+    # call — see the `pots` property below.
+    _final_pots: tuple[Pot, ...] | None = field(default=None, repr=False)
+
+    @property
+    def pots(self) -> tuple[Pot, ...]:
+        """Overrides `__getattr__` delegation deliberately: `pk.pots` is
+        drained (mutated to `0`) by `push_chips()` once the hand resolves
+        (docs/DECISIONS.md, "three real bugs found only by driving real
+        hands" — Bug 1), so reading it post-hoc — exactly what a caller
+        checking pot structure *after* a hand completes would naturally do
+        — always sees zeroed amounts, not what was actually paid out. This
+        returns the last pre-drain snapshot once one exists (captured in
+        `_finalize`, before any `push_chips()` call) and falls through to
+        the live pokerkit value otherwise (mid-hand, where nothing has
+        drained yet)."""
+        if self._final_pots is not None:
+            return self._final_pots
+        return tuple(self.pk.pots)
+
+    @property
+    def runout_count(self) -> int:
+        """Overrides `__getattr__` delegation deliberately: pokerkit's own
+        `state.runout_count` stays `None` for the entire hand in
+        `Mode.TOURNAMENT` — no runout-count selection ever happens there,
+        so it's never explicitly set (docs/DECISIONS.md,
+        "Automation.RUNOUT_COUNT_SELECTION is unnecessary, not just
+        unused"). `None` reads as "unset, check elsewhere" rather than
+        "guaranteed to behave as 1"; this reports the actual guarantee
+        instead of leaving a caller to infer it from a missing value."""
+        value = self.pk.runout_count
+        return value if value is not None else 1
+
+    def __getattr__(self, name: str) -> object:
+        """Transparent read-through to the wrapped `pokerkit.State` for any
+        attribute `GameState` doesn't define itself.
+
+        §10's derivation table is written entirely in terms of `state.X`
+        (`state.hole_cards[i]`, `state.pots`, `state.bets[i]`,
+        `state.can_win_now(seat)`, ...), matching raw pokerkit attribute
+        names directly — the natural reading is that whatever
+        `GameAdapter.reset()` returns supports that same access pattern.
+        But §10 also requires bookkeeping pokerkit doesn't do on its own
+        ("maintain our own per-seat status alongside PokerKit state rather
+        than deriving it fresh each view"), which is exactly why
+        `GameState` exists as a wrapper instead of `reset()` just handing
+        back the bare `State`. This delegation makes both true at once:
+        `GameState`'s own fields (seat_status, phase, ...) take priority as
+        normal attributes, and anything it doesn't define falls through to
+        `self.pk` unchanged. Only triggered for names normal attribute
+        lookup doesn't find — `GameState`'s own dataclass fields are never
+        shadowed by this. See docs/DECISIONS.md."""
+        return getattr(self.pk, name)
 
 
 def _int(value: object) -> int:
     assert isinstance(value, int)
     return value
+
+
+def _check_cross_field_config(sb: int, bb: int, ante: int, starting_stack: int) -> None:
+    """The cross-field constraints `config_schema` (plain JSON Schema)
+    cannot express — no `sb`/`bb` comparison keyword exists in the schema
+    draft this package validates against, and the `jsonschema` build here
+    has no `$data` extension (verified, not assumed). Shared between
+    `validate_config` (the real gate, called at room creation) and `reset`
+    (defensive only — see its call site)."""
+    if sb <= 0 or bb <= 0 or ante < 0 or starting_stack <= 0:
+        raise ValueError("sb, bb, and starting_stack must be positive; ante must be non-negative")
+    if sb >= bb:
+        raise ValueError(f"sb ({sb}) must be less than bb ({bb})")
+    if starting_stack < bb:
+        raise ValueError(f"starting_stack ({starting_stack}) must be at least bb ({bb})")
 
 
 def _unstamped(event_type: EventType, payload: object) -> Event:
@@ -212,7 +280,12 @@ def _finalize(s: GameState) -> list[Event]:
     # out from under it, since a tuple only freezes which objects it holds,
     # not their contents. This was caught by a smoke-test run, not by mypy
     # or a type system — see docs/DECISIONS.md.
-    pot_amounts_before = [p.amount for p in tuple(pk.pots)]
+    raw_pots = tuple(pk.pots)
+    pot_amounts_before = [p.amount for p in raw_pots]
+    # Also freeze independent copies for the `pots` property (above) to
+    # serve post-hoc — same reasoning, decoupled from the objects
+    # push_chips() is about to mutate.
+    s._final_pots = tuple(Pot(p.raked_amount, p.unraked_amount, p.player_indices) for p in raw_pots)
 
     if s.hand_had_showdown:
         per_pot_awards: dict[int, list[Award]] = {i: [] for i in range(len(pot_amounts_before))}
@@ -296,22 +369,33 @@ class HoldemAdapter:
             "additionalProperties": False,
         }
 
+    def validate_config(self, cfg: dict[str, object]) -> None:
+        """Not in §9 — called by the room server at `POST /rooms`, before a
+        room is created, so a config that fails only this (not
+        `config_schema`) still gets `400 invalid_config` at creation time
+        instead of crashing `/start` later. See docs/DECISIONS.md, "a bad
+        config could crash /start instead of failing at POST /rooms"."""
+        sb = _int(cfg["sb"])
+        bb = _int(cfg["bb"])
+        ante = _int(cfg.get("ante", 0))
+        starting_stack = _int(cfg["starting_stack"])
+        _check_cross_field_config(sb, bb, ante, starting_stack)
+
     def reset(self, cfg: dict[str, object], deck: list[str]) -> GameState:
         sb = _int(cfg["sb"])
         bb = _int(cfg["bb"])
         ante = _int(cfg.get("ante", 0))
         starting_stack = _int(cfg["starting_stack"])
+        # Defensive, not the primary gate: `validate_config` above is what
+        # the room server calls at POST /rooms time. This repeats the same
+        # checks so a caller that invokes reset() directly (as several of
+        # this package's own unit tests deliberately do) still gets a clear
+        # error instead of a confusing failure deeper in pokerkit.
+        _check_cross_field_config(sb, bb, ante, starting_stack)
         # `_seats` is a room-server-injected reserved key, not part of
         # config_schema — see packages/room_server/store.py and its
         # docs/DECISIONS.md entry on why §9's reset(cfg, deck) needs it.
         seats_total = _int(cfg["_seats"])
-
-        if sb <= 0 or bb <= 0 or ante < 0 or starting_stack <= 0:
-            raise ValueError("sb, bb, and starting_stack must be positive; ante must be non-negative")
-        if sb >= bb:
-            raise ValueError(f"sb ({sb}) must be less than bb ({bb})")
-        if starting_stack < bb:
-            raise ValueError(f"starting_stack ({starting_stack}) must be at least bb ({bb})")
 
         remaining_deck = list(deck)
         pk = NoLimitTexasHoldem.create_state(
@@ -463,16 +547,24 @@ class HoldemAdapter:
             raise IllegalAction(f"seat {seat} has no showdown decision pending", [])
 
         show = a.type == ActionType.SHOW
+        # Captured BEFORE show_or_muck_hole_cards, not after: for the LAST
+        # seat with a pending showdown decision, that call itself cascades
+        # synchronously all the way through pokerkit's internal
+        # _end_showdown -> _begin_hand_killing chain (HAND_KILLING is an
+        # enabled automation) before it returns control here — the same
+        # class of bug _build_reveal's docstring documents for the all-in
+        # path, just reachable one call earlier than it looks. Verified by
+        # an end-to-end run: seat 3 of 4 (the last to show) came back with
+        # hole=[] until this line moved above the call. Regression test:
+        # test_last_to_show_in_a_3way_discretionary_showdown_has_nonempty_hole_cards_even_when_losing.
+        # See docs/DECISIONS.md.
+        hole = [repr(c) for c in s.pk.hole_cards[seat]]
         s.pk.show_or_muck_hole_cards(show, seat)
         s.awaiting_showdown_seat = None
         s.last_action[seat] = a
 
         events: list[Event] = []
         if show:
-            # Captured now, before _advance() below can trigger hand-killing
-            # (see _build_reveal's docstring) if this turns out to be a
-            # losing hand.
-            hole = [repr(c) for c in s.pk.hole_cards[seat]]
             reveal = _build_reveal(seat, hole, _board(s.pk))
             s.revealed[seat] = reveal
             events.append(_unstamped(EventType.SHOWDOWN, ShowdownPayload(reveals=[reveal])))

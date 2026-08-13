@@ -2,9 +2,11 @@
 
 `create_app` takes an adapter registry so a real game package can be wired
 in without this module importing it — see AGENTS.md invariant 7 and the
-CRITICAL BOUNDARY note in `adapter.py`. The module-level `app` used by
-`make dev` / `uvicorn packages.room_server.main:app` registers only the
-local `StubAdapter`, since `packages/game-holdem` does not exist yet.
+CRITICAL BOUNDARY note in `adapter.py`. `packages/game-holdem` now exists;
+`_default_adapters` registers it automatically when it's importable (see
+its docstring), so the module-level `app` used by `make dev` / `uvicorn
+packages.room_server.main:app` serves real poker, not just the local
+`StubAdapter`.
 """
 
 from __future__ import annotations
@@ -46,11 +48,40 @@ def _parse_action(action_in: ActionRequest) -> Action:
     return Action(type=action_type, to=action_in.action.to)
 
 
+def _default_adapters() -> dict[str, GameAdapter[Any]]:
+    """The registry `create_app()` uses when no explicit `adapters=` is
+    given — what `make dev`'s module-level `app` (below) and any test that
+    imports `app` directly gets. Always includes the local `StubAdapter`
+    (lightweight, dependency-free, used by this package's own unit tests).
+    Also registers the real `holdem-nl` game via
+    `packages.game_holdem.adapter.HoldemAdapter` when that package is
+    importable, so the *default* server is actually playable poker instead
+    of a placeholder that only speaks a toy game.
+
+    A plain `try/except ImportError`, not a hard dependency: this package
+    still never assumes game-holdem exists as a matter of design (AGENTS.md
+    invariant 7 — nothing here imports `pokerkit`, directly or otherwise;
+    `packages/game_holdem` is the only package permitted to). It just uses
+    the real game when it's present, the same way `scripts/_serve_holdem.py`
+    already did explicitly — folded in here so that script and `make dev`
+    aren't two different ways to get two different servers. Explicit
+    `create_app(adapters=...)` calls are unaffected and remain the primary,
+    documented extension point. See docs/DECISIONS.md."""
+    adapters: dict[str, GameAdapter[Any]] = {"stub": StubAdapter()}
+    try:
+        from packages.game_holdem.adapter import HoldemAdapter
+    except ImportError:
+        pass
+    else:
+        adapters["holdem-nl"] = HoldemAdapter()
+    return adapters
+
+
 def create_app(
     adapters: dict[str, GameAdapter[Any]] | None = None,
     allow_fixed_seed: bool | None = None,
 ) -> FastAPI:
-    registry: dict[str, GameAdapter[Any]] = adapters if adapters is not None else {"stub": StubAdapter()}
+    registry: dict[str, GameAdapter[Any]] = adapters if adapters is not None else _default_adapters()
     store: RoomStore[Any] = RoomStore(
         adapters=registry,
         allow_fixed_seed=server_config.allow_fixed_seed() if allow_fixed_seed is None else allow_fixed_seed,

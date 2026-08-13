@@ -281,6 +281,49 @@ def test_known_winner_shows_and_takes_the_pot_loser_can_muck() -> None:
     assert obs.seats[1].revealed is None
 
 
+def test_last_to_show_in_a_3way_discretionary_showdown_has_nonempty_hole_cards_even_when_losing() -> None:
+    """Regression test for a real bug (docs/DECISIONS.md, "a real
+    game-holdem bug found via play_hand.sh"): for the LAST seat with a
+    pending showdown decision, show_or_muck_hole_cards() itself cascades
+    synchronously through pokerkit's internal hand-killing (which clears a
+    losing hand's hole cards) before returning. Capturing hole cards
+    *after* that call instead of *before* silently produced an empty
+    `hole` for whichever seat happened to decide last, if they lost.
+
+    This needs the last decider to actually *lose* — with the unrigged
+    deck every seat ties on the board's own straight flush (`can_win_now`
+    is true for all of them, so hand-killing never fires), which is
+    exactly why this went undetected: an earlier version of this test used
+    an unrigged deck and kept passing even with the bug reintroduced.
+    Rigged so seat 2 (empirically the last to decide in this 3-seat,
+    button-last setup) holds the clear loser."""
+    adapter = HoldemAdapter()
+    deck = _rigged_deck("AhAd", "KsKc", "2c3d", "9h4s7cJd6h")
+    s = adapter.reset(_cfg(3, starting_stack=5000), deck)
+    _check_to_showdown(adapter, s, 3)
+
+    all_events: list[object] = []
+    decision_order: list[int] = []
+    for _ in range(4):
+        seat = _to_act(adapter, s)
+        if seat is None:
+            break
+        decision_order.append(seat)
+        all_events.extend(adapter.apply(s, seat, Action(type=ActionType.SHOW)))
+
+    assert adapter.is_terminal(s)
+    assert decision_order[-1] == 2, "this test only proves the fix if seat 2 (the rigged loser) decides last"
+    showdown_events = [e for e in all_events if e.type == EventType.SHOWDOWN]
+    assert len(showdown_events) == 3, "one individual showdown event per discretionary show (no all-in here)"
+    revealed = {r.seat: r.hole for e in showdown_events for r in e.payload.reveals}
+    assert set(revealed) == {0, 1, 2}
+    for seat, hole in revealed.items():
+        assert hole, f"seat {seat}'s revealed hole cards must never be empty"
+        assert len(hole) == 2
+    results = adapter.results(s)
+    assert results[2] < 0, "seat 2 must actually be the loser for this test to exercise the hand-killing path"
+
+
 def test_known_winner_all_in_preflop_still_gets_correct_award() -> None:
     """Same rigged hand, but both shove preflop — no discretion exists
     (§3.1), so both get force-shown, and the pot still goes to aces."""

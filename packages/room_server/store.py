@@ -436,6 +436,15 @@ class RoomStore(Generic[S]):
             jsonschema.validate(instance=config, schema=adapter.config_schema)
         except jsonschema.exceptions.ValidationError as exc:
             raise ApiError(ErrorCode.INVALID_CONFIG, exc.message) from exc
+        try:
+            adapter.validate_config(config)
+        except ValueError as exc:
+            # config_schema (plain JSON Schema) can't express cross-field
+            # constraints like "sb < bb" — validate_config is the adapter's
+            # hook for exactly that, called here so a bad config fails at
+            # room creation, not later inside reset() at /start (§6). See
+            # docs/DECISIONS.md.
+            raise ApiError(ErrorCode.INVALID_CONFIG, str(exc)) from exc
         if seed is not None and not self._allow_fixed_seed:
             raise ApiError(ErrorCode.BAD_REQUEST, "seed is only accepted when ARENA_ALLOW_FIXED_SEED=1")
 

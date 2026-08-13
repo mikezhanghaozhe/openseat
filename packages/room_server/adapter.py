@@ -10,6 +10,10 @@ anywhere else in this package.
 `setup_events` is not part of §9 as written — see docs/DECISIONS.md
 "room-server: hand-start events need an adapter hook" for why it was added
 and what to flag to the PROTOCOL.md owner.
+
+`validate_config` is likewise not part of §9 — see docs/DECISIONS.md
+"room-server + game-holdem: a bad config could crash /start instead of
+failing at POST /rooms" for why it was added.
 """
 
 from __future__ import annotations
@@ -31,6 +35,18 @@ class GameAdapter(Protocol[S]):
     min_players: int
     max_players: int
     config_schema: dict[str, object]
+
+    def validate_config(self, cfg: dict[str, object]) -> None:
+        """Not in §9. Raise `ValueError` with a human-readable reason if
+        `cfg` is semantically invalid in a way `config_schema` (plain JSON
+        Schema) cannot express — e.g. a cross-field constraint like `sb <
+        bb`. Called by the room server at `POST /rooms`, after
+        `config_schema` validation and before the room is created (§6:
+        "A bad config must fail here, not crash inside reset() far from the
+        cause"). Must not raise for any `cfg` that already satisfies
+        `config_schema` and has no cross-field problems — this is
+        additive, not a second pass at what the schema already checks."""
+        ...
 
     def reset(self, cfg: dict[str, object], deck: list[str]) -> S:
         """The room server draws the shuffle; the adapter does no shuffling
