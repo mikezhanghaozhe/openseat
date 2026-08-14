@@ -3,3 +3,4 @@ uvicorn[standard]
 pokerkit==0.7.4
 pydantic
 httpx
+jsonschema
