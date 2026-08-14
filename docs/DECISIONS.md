@@ -871,3 +871,61 @@ room. So this is a legitimate config field that happens to unblock the tests, un
 for depending on PokerKit — would have shipped M1 entirely unverified. Three contract tests added.
 Validation: length equals `seats`, entries integer `>= bb`, both fields present is
 `400 invalid_config`.
+
+---
+
+## 2026-08-14 — room-server: zero `Observation` construction sites, via `GameAdapter.waiting_view`
+
+`Room._waiting_observation` in `store.py` built the pre-`/start` `Observation` by hand — a second
+`Observation(...)` call site in `packages/room_server/`, alongside the one inside `Room.view`'s
+delegation to `adapter.view`. It was harmless today (every field runs empty, before any cards
+exist), but it broke the property that made invariant 2 grep-checkable: "exactly one place
+constructs `Observation`" degrades from a fact you can verify with `grep -rn "Observation(" ` to a
+fact you have to re-derive by reading both sites and reasoning about why the second one happens to
+be safe. That reasoning does not survive the next person adding a spectator view or a between-hands
+state to the same function.
+
+**Fix.** Added `GameAdapter.waiting_view(cfg, seats, seat)` to §9 (not in the original protocol
+text, like `setup_events`/`validate_config` before it) and moved the waiting-observation logic
+behind it, implemented identically in `StubAdapter` and `HoldemAdapter`. `store.py` now only ever
+calls `adapter.view` or `adapter.waiting_view` and passes the result through the same `_overlay`
+used for the in-hand path — no bespoke envelope construction left in `store.py`.
+
+**Why `SeatJoinedPayload` for the `seats` param, not a new type.** It already has exactly
+`seat`/`name`/`kind` — the only fields the waiting view needs — so introducing a dedicated type
+would duplicate it for no gain.
+
+**Scope note.** `grep -rn "Observation(" packages/room_server/` still returns hits in `stub.py`:
+`StubAdapter.view` and `StubAdapter.waiting_view`. Those are legitimate — `StubAdapter` is a
+`GameAdapter` implementation that happens to live inside `packages/room_server/` rather than its
+own `packages/game-*` package (it predates `game-holdem` and nothing has moved it since), so its
+adapter methods are the same kind of construction site `HoldemAdapter.view` is in
+`packages/game_holdem/`, just not filtered out by a path-based grep. The invariant the grep is
+meant to check — "the room server itself never builds an `Observation`" — now holds; the grep
+needs a smarter filter (e.g. exclude adapter implementation files, or grep for the pattern outside
+adapter classes) to say so on its own. Flagged rather than silently worked around.
+
+---
+
+## 2026-08-14 — game-holdem: live bets belong in `pot_total`, not as a synthetic `pots[]` entry
+
+`pk.pots` (PokerKit) only reflects streets already swept by bet collection — it is `()` for the
+entire preflop round even with both blinds posted, confirmed empirically (`test_preflop_blinds_
+are_in_pot_total_but_not_in_pots`). `HoldemAdapter.view` used to paper over this by appending a
+synthetic `PotView` for `sum(pk.bets)` whenever it was nonzero, so a viewer's "chips in the middle
+right now" wouldn't under-report during a live street.
+
+**Why that was wrong.** `pots[].index` is not decorative — §5's `pot_awarded` event references pot
+indices, so a client uses them to line up which pot resolved. The synthetic entry was not a real
+pot: it hadn't been divided into tiers yet (a raise-and-multiple-calls can still fragment into a
+side pot once someone goes all-in), and once it resolved into real settled pots, every index after
+it would shift. An index that means one thing mid-hand and another at award time is exactly the
+kind of bug a client can't defend against.
+
+**Fix.** `pots[]` now contains only `tuple(pk.pots)`, unchanged from settlement to settlement —
+indices are stable and match what `pot_awarded` will later reference. `pot_total` is `sum(settled
+pot amounts) + sum(pk.bets)`, so it still reports the live total continuously through a hand; the
+uncollected-bets number just moved from one existing field to the other, no new `Observation`
+field. `pot_total` is provably unchanged at the instant a street closes and PokerKit sweeps `bets`
+into `pots` — same chips, relabeled — pinned by
+`test_pot_total_is_unchanged_when_a_street_closes_and_bets_sweep_into_pots`.

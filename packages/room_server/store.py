@@ -38,11 +38,9 @@ from packages.engine.types import (
     RoomCreatedPayload,
     SeatJoinedPayload,
     SeatKind,
-    SeatStatus,
     SeatView,
     ShowdownPayload,
     TableTalkPayload,
-    YouView,
 )
 from packages.room_server.adapter import GameAdapter, S
 from packages.room_server.errors import ApiError
@@ -168,50 +166,12 @@ class Room(Generic[S]):
             chat=self._chat(),
         )
 
-    def _waiting_observation(self, seat: SeatSlot) -> Observation:
-        assert seat.name is not None and seat.kind is not None
-        seats = [
-            SeatView(
-                seat=s.index,
-                name=s.name,
-                kind=s.kind,
-                stack=0,
-                committed_street=0,
-                status=SeatStatus.ACTIVE,
-                last_action=None,
-            )
+    def _claimed_seats(self) -> list[SeatJoinedPayload]:
+        return [
+            SeatJoinedPayload(seat=s.index, name=s.name, kind=s.kind)
             for s in self.seats
             if s.status == "claimed" and s.name is not None and s.kind is not None
         ]
-        you = YouView(
-            seat=seat.index,
-            name=seat.name,
-            hole=[],
-            stack=0,
-            committed_street=0,
-            committed_hand=0,
-            status=SeatStatus.ACTIVE,
-        )
-        return Observation(
-            protocol_version=PROTOCOL_VERSION,
-            seq=self.seq,
-            room_id=self.room_id,
-            hand_no=0,
-            phase=Phase.WAITING,
-            to_act=None,
-            button=0,
-            you=you,
-            board=[],
-            pots=[],
-            pot_total=0,
-            seats=seats,
-            to_call=None,
-            min_raise_to=None,
-            max_raise_to=None,
-            legal_actions=[],
-            chat=self._chat(),
-            text="Waiting for the room to start.",
-        )
 
     # -- public API, each acquires the room's lock --------------------------
 
@@ -350,7 +310,8 @@ class Room(Generic[S]):
         async with self.lock:
             seat = self._seat_by_token(seat_token)
             if self.state is None:
-                return self._waiting_observation(seat)
+                obs = self.adapter.waiting_view(self.config, self._claimed_seats(), seat.index)
+                return self._overlay(obs)
             obs = self.adapter.view(self.state, seat.index)
             return self._overlay(obs)
 

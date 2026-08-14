@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from tests.contract.conftest import (
+    claim_seat,
     create_room,
     events,
     result,
@@ -240,3 +241,36 @@ async def test_result_contains_no_hole_card_absent_from_the_public_event_log(
     cards_in_result = set(_CARD_RE.findall(json.dumps(res)))
     for card in cards_in_result:
         assert card in log_text, f"/result exposed {card!r}, which never appeared in the public event log"
+
+
+async def test_waiting_view_carries_no_card_data(client: httpx.AsyncClient) -> None:
+    """Pins the pre-`/start` `Observation` (`GameAdapter.waiting_view`, moved
+    out of `store.py` to keep `packages/room_server/` at zero `Observation`
+    construction sites — docs/DECISIONS.md "room-server: zero `Observation`
+    construction sites"). No `GameState` exists yet at this point, so nothing
+    resembling a card may appear anywhere in the view: `you.hole` must be
+    empty, `board` must be empty, `pots` must be empty, and no `SeatView` may
+    carry a `revealed` entry. A later change that starts filling this view in
+    with real state before `/start` would trip this test first."""
+    room = await create_room(client, seats=2)
+    assert room.status_code == 201, room.text
+    body = room.json()
+    room_id = body["room_id"]
+
+    seat0 = await claim_seat(client, room_id, body["invite_token"], 0, "alice")
+    assert seat0.status_code == 201, seat0.text
+    seat1 = await claim_seat(client, room_id, body["invite_token"], 1, "bob")
+    assert seat1.status_code == 201, seat1.text
+
+    v = (await view(client, room_id, seat0.json()["seat_token"])).json()
+
+    assert v["phase"] == "waiting"
+    assert v.get("to_act") is None
+    assert v["you"]["hole"] == []
+    assert v["board"] == []
+    assert v["pots"] == []
+    assert v["pot_total"] == 0
+    assert len(v["seats"]) == 2
+    for sv in v["seats"]:
+        assert "revealed" not in sv or sv["revealed"] is None
+        assert not _CARD_RE.search(json.dumps(sv))

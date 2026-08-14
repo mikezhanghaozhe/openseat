@@ -25,6 +25,7 @@ from packages.engine.types import (
     ActionSpec,
     Event,
     Observation,
+    SeatJoinedPayload,
 )
 
 S = TypeVar("S")
@@ -78,6 +79,18 @@ class GameAdapter(Protocol[S]):
         adapter cannot know; the room server overlays them afterward. Seat
         `name`/`kind` are also room-server-owned (join-time metadata) and are
         overlaid the same way — see docs/DECISIONS.md."""
+        ...
+
+    def waiting_view(self, cfg: dict[str, object], seats: list[SeatJoinedPayload], seat: int) -> Observation:
+        """Not in §9 as originally written — see docs/DECISIONS.md "room-
+        server: zero Observation construction sites". Builds the `Observation`
+        shown before `/start`, when `self.state` is `None` and no cards exist
+        yet. `seats` is every currently-claimed seat's join-time metadata;
+        `seat` is the index of the seat requesting the view (always present in
+        `seats`, since only claimed seats can hold a valid seat_token). Same
+        envelope-overlay contract as `view()` — `protocol_version`, `seq`,
+        `room_id`, and `chat` are placeholders the room server overlays
+        afterward."""
         ...
 
     def is_terminal(self, s: S) -> bool: ...

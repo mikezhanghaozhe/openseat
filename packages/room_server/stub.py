@@ -31,6 +31,7 @@ from packages.engine.types import (
     PotAwardedPayload,
     PotAwardReason,
     PotView,
+    SeatJoinedPayload,
     SeatKind,
     SeatStatus,
     SeatView,
@@ -240,6 +241,50 @@ class StubAdapter:
             legal_actions=self.legal_actions(s, seat),
             chat=[],
             text=f"Stub game, seat {seat}, phase {s.phase.value}.",
+        )
+
+    def waiting_view(self, cfg: dict[str, object], seats: list[SeatJoinedPayload], seat: int) -> Observation:
+        seat_views = [
+            SeatView(
+                seat=s.seat,
+                name=s.name,
+                kind=s.kind,
+                stack=0,
+                committed_street=0,
+                status=SeatStatus.ACTIVE,
+                last_action=None,
+            )
+            for s in seats
+        ]
+        me = next(s for s in seats if s.seat == seat)
+        you = YouView(
+            seat=me.seat,
+            name=me.name,
+            hole=[],
+            stack=0,
+            committed_street=0,
+            committed_hand=0,
+            status=SeatStatus.ACTIVE,
+        )
+        return Observation(
+            protocol_version="",
+            seq=0,
+            room_id="",
+            hand_no=0,
+            phase=Phase.WAITING,
+            to_act=None,
+            button=0,
+            you=you,
+            board=[],
+            pots=[],
+            pot_total=0,
+            seats=seat_views,
+            to_call=None,
+            min_raise_to=None,
+            max_raise_to=None,
+            legal_actions=[],
+            chat=[],
+            text="Waiting for the room to start.",
         )
 
     def is_terminal(self, s: _StubState) -> bool:
