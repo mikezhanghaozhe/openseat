@@ -15,6 +15,7 @@ from typing import Any
 
 from fastapi import FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 from packages.engine.types import Action, ActionType, ErrorCode
 from packages.room_server import config as server_config
@@ -88,6 +89,13 @@ def create_app(
     )
 
     app = FastAPI()
+
+    app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],      # demo only
+    allow_methods=["*"],
+    allow_headers=["*"],
+    )
 
     @app.exception_handler(ApiError)
     async def _handle_api_error(_request: Request, exc: ApiError) -> JSONResponse:
