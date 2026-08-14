@@ -222,6 +222,61 @@ def test_pot_total_reflects_uncollected_bets_mid_street() -> None:
     assert obs.pot_total == 75
 
 
+def test_preflop_blinds_are_in_pot_total_but_not_in_pots() -> None:
+    """Preflop, with only blinds posted: `pots[]` stays empty (nothing has
+    been swept yet) while `pot_total` already reflects the blinds — this is
+    the case that motivated tracking live bets in the first place."""
+    adapter = HoldemAdapter()
+    s = adapter.reset(_cfg(2), _full_deck())  # sb=25, bb=50
+    obs = adapter.view(s, 0)
+    assert obs.pots == []
+    assert obs.pot_total == 75
+
+
+def test_live_bets_beyond_blinds_show_in_pot_total_not_pots() -> None:
+    """Mid-street, after a raise the round hasn't closed on yet: the raised
+    amount is uncollected `pk.bets`, not a settled `pk.pots` entry — it must
+    move `pot_total` without appearing in `pots[]`."""
+    adapter = HoldemAdapter()
+    s = adapter.reset(_cfg(3), _full_deck())  # sb=25, bb=50
+    seat = _to_act(adapter, s)
+    assert seat is not None
+    legal = adapter.legal_actions(s, seat)
+    raise_spec = next(a for a in legal if a.type == ActionType.RAISE)
+    assert raise_spec.min_to is not None
+    adapter.apply(s, seat, Action(type=ActionType.RAISE, to=raise_spec.min_to))
+
+    obs = adapter.view(s, 0)
+    assert obs.pots == []
+    assert obs.pot_total == 175  # 25 + 50 blinds + a raise to 100
+
+
+def test_pot_total_is_unchanged_when_a_street_closes_and_bets_sweep_into_pots() -> None:
+    """When betting on a street closes, `pk.bets` empties into `pk.pots` —
+    `pots[]` goes from empty to populated, but `pot_total` must not jump:
+    it's the same chips, just relabeled from live to settled."""
+    adapter = HoldemAdapter()
+    s = adapter.reset(_cfg(2), _full_deck())  # sb=25, bb=50
+
+    sb_seat = _to_act(adapter, s)
+    assert sb_seat is not None
+    adapter.apply(s, sb_seat, Action(type=ActionType.CALL))  # SB calls to 50; round not closed yet
+
+    mid = adapter.view(s, 0)
+    assert mid.pots == []
+    assert mid.pot_total == 100
+
+    bb_seat = _to_act(adapter, s)
+    assert bb_seat is not None
+    adapter.apply(s, bb_seat, Action(type=ActionType.CHECK))  # BB checks; street closes, bets sweep
+
+    after = adapter.view(s, 0)
+    assert after.phase == Phase.FLOP
+    assert after.pots != []
+    assert sum(p.amount for p in after.pots) == 100
+    assert after.pot_total == 100  # unchanged across the sweep
+
+
 # -- uncontested / showdown mechanics -------------------------------------------
 
 

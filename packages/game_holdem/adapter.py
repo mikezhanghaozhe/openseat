@@ -40,6 +40,7 @@ from packages.engine.types import (
     PotAwardReason,
     PotView,
     Reveal,
+    SeatJoinedPayload,
     SeatKind,
     SeatStatus,
     SeatView,
@@ -604,18 +605,17 @@ class HoldemAdapter:
         pk = s.pk
         pots = tuple(pk.pots)  # materialized ONCE (§10 trap)
         pot_views = [PotView(index=i, amount=p.amount, eligible_seats=list(p.player_indices)) for i, p in enumerate(pots)]
-        pot_total = sum(p.amount for p in pots)
         # `pk.pots` only reflects streets already swept by bet collection —
         # the current street's live bets sit in `pk.bets` uncollected until
         # the round closes, so `tuple(pk.pots)` alone under-reports the pot
-        # for most of a hand (confirmed empirically: it's `()` for the
-        # entire preflop round, even with both blinds posted). A viewer's
-        # "total in the middle right now" must include those too.
-        live_bets = sum(pk.bets)
-        if live_bets:
-            live_seats = [i for i in range(s.seats_total) if s.seat_status[i] != SeatStatus.FOLDED]
-            pot_views.append(PotView(index=len(pot_views), amount=live_bets, eligible_seats=live_seats))
-            pot_total += live_bets
+        # for most of a hand (confirmed empirically: it's `()` for the entire
+        # preflop round, even with both blinds posted). Those live bets go
+        # into `pot_total` only, not `pots[]`: `pots[].index` must stay
+        # stable for `pot_awarded` (§5) to reference, and a live bet is not
+        # yet a settled pot — it hasn't been divided into tiers, so folding
+        # it into `pots[]` would shift every later index once it resolves.
+        # See docs/DECISIONS.md.
+        pot_total = sum(p.amount for p in pots) + sum(pk.bets)
 
         if s.phase == Phase.HAND_COMPLETE:
             to_act = None
@@ -674,6 +674,50 @@ class HoldemAdapter:
             legal_actions=self.legal_actions(s, seat),
             chat=[],  # overlaid by the room server
             text=_render_text(s, seat, board, to_call),
+        )
+
+    def waiting_view(self, cfg: dict[str, object], seats: list[SeatJoinedPayload], seat: int) -> Observation:
+        seat_views = [
+            SeatView(
+                seat=s.seat,
+                name=s.name,
+                kind=s.kind,
+                stack=0,
+                committed_street=0,
+                status=SeatStatus.ACTIVE,
+                last_action=None,
+            )
+            for s in seats
+        ]
+        me = next(s for s in seats if s.seat == seat)
+        you = YouView(
+            seat=me.seat,
+            name=me.name,
+            hole=[],
+            stack=0,
+            committed_street=0,
+            committed_hand=0,
+            status=SeatStatus.ACTIVE,
+        )
+        return Observation(
+            protocol_version="",
+            seq=0,
+            room_id="",
+            hand_no=0,
+            phase=Phase.WAITING,
+            to_act=None,
+            button=0,
+            you=you,
+            board=[],
+            pots=[],
+            pot_total=0,
+            seats=seat_views,
+            to_call=None,
+            min_raise_to=None,
+            max_raise_to=None,
+            legal_actions=[],
+            chat=[],
+            text="Waiting for the room to start.",
         )
 
     def is_terminal(self, s: GameState) -> bool:
