@@ -5,8 +5,6 @@ conftest.py and test_adapter_dealing.py's module docstring.
 
 from __future__ import annotations
 
-from packages.game_holdem.adapter import HoldemAdapter
-
 from packages.engine.types import (
     Action,
     ActionType,
@@ -15,6 +13,7 @@ from packages.engine.types import (
     PotAwardReason,
     SeatStatus,
 )
+from packages.game_holdem.adapter import HoldemAdapter
 
 RANKS = "23456789TJQKA"
 SUITS = "cdhs"
@@ -27,6 +26,9 @@ def _deck() -> list[str]:
 def _cfg(seats: int, **overrides: object) -> dict[str, object]:
     base: dict[str, object] = {"sb": 25, "bb": 50, "ante": 0, "starting_stack": 500, "_seats": seats}
     base.update(overrides)
+    if "starting_stacks" in overrides:
+        # §6: exactly one of starting_stack / starting_stacks may be present.
+        base.pop("starting_stack", None)
     return base
 
 
@@ -75,19 +77,40 @@ def _check_down_to_showdown(adapter: HoldemAdapter, state: object, seats: int) -
 
 def test_3way_all_in_unequal_stacks_produces_multiple_pots_with_correct_eligibility() -> None:
     """§10 checklist: "3-way all-in with unequal stacks produces >1 entry in
-    pots[] with correct eligible_seats." Stacks end up unequal even with a
-    uniform `starting_stack` because blinds commit sb/bb asymmetrically
-    before anyone acts — verified against `pokerkit`'s pre-split
+    pots[] with correct eligible_seats." A uniform `starting_stack` cannot
+    reach this scenario: within one hand, every `call` matches the current
+    bet exactly, so any two live seats always hold identical capacity —
+    three real stack tiers are mathematically unreachable without unequal
+    starting stacks. `config.starting_stacks` (docs/PROTOCOL.md §6,
+    docs/DECISIONS.md "starting_stacks: per-seat stacks in room config")
+    exists for exactly this. Verified against `pokerkit`'s pre-split
     `state.pots` (§10: "side pots arrive pre-split, no remainder math
-    required"; PROTOCOL_REVIEW finding #2 in docs/DECISIONS.md)."""
+    required"; PROTOCOL_REVIEW finding #2 in docs/DECISIONS.md).
+
+    With stacks 100/300/600, seat 0's 100 caps the main pot at every seat;
+    seats 1 and 2 then fight a side pot up to 300 (seat 1's cap); seat 2's
+    remaining excess above 300 has nobody left to contest it and is
+    returned uncalled — so exactly two pot tiers, not three, is the
+    correct outcome for three *distinct* stacks, not a weaker assertion."""
     adapter = HoldemAdapter()
-    state = adapter.reset(_cfg(3, starting_stack=150), _deck())
-    _shove_everyone(adapter, state, 3)
+    state = adapter.reset(_cfg(3, starting_stacks=[100, 300, 600]), _deck())
+    events = _shove_everyone(adapter, state, 3)
 
     pots = tuple(state.pots)
     assert len(pots) > 1, "unequal all-in stacks must split into more than one pot tier"
-    for pot in pots:
-        assert pot.player_indices, "every pot must carry its own eligible-seat list"
+    assert [tuple(sorted(p.player_indices)) for p in pots] == [(0, 1, 2), (1, 2)], (
+        "main pot must be eligible to every live seat; the side pot only to the two larger stacks"
+    )
+    assert pots[0].amount == 300, "main pot: 100 from each of the three seats"
+    assert pots[1].amount == 400, "side pot: 200 more each from seats 1 and 2, capped at seat 1's 300 stack"
+
+    pot_awarded = next(e for e in events if e.type == EventType.POT_AWARDED)
+    assert len(pot_awarded.payload.pots) == len(pots)
+    for pot_view, pot in zip(pot_awarded.payload.pots, pots):
+        assert sum(a.amount for a in pot_view.awards) == pot.amount == pot_view.amount
+        assert {a.seat for a in pot_view.awards} <= set(pot.player_indices), (
+            "a pot can only be awarded to seats eligible for it"
+        )
 
 
 def test_seat_status_matches_derivation_table_for_fold_all_in_and_active() -> None:
@@ -105,11 +128,12 @@ def test_seat_status_matches_derivation_table_for_fold_all_in_and_active() -> No
     assert adapter.view(state, folded_seat).you.status == SeatStatus.FOLDED
 
     remaining = [s for s in range(3) if s != folded_seat]
-    active_seat = remaining[0]
+    all_in_seat = _to_act(adapter, state)
+    assert all_in_seat in remaining, "the seat to act next must be one of the two live seats"
+    active_seat = next(s for s in remaining if s != all_in_seat)
     obs = adapter.view(state, active_seat)
     assert obs.you.status == SeatStatus.ACTIVE
 
-    all_in_seat = remaining[1]
     legal = adapter.legal_actions(state, all_in_seat)
     raise_spec = next(a for a in legal if a.type == ActionType.RAISE)
     assert raise_spec.max_to is not None

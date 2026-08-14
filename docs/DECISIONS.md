@@ -845,3 +845,29 @@ bullet was checked directly against the fully-wired system:
 isolated package's own tests, and not by `scripts/_serve_holdem.py`'s one-off wiring, which no
 longer needs to exist separately from `make dev` now that Bug 2's fix folded the same wiring into
 `room_server`'s own default.
+
+---
+
+## 2026-08-14 — `starting_stacks`: per-seat stacks in room config
+
+**Decision.** `POST /rooms` accepts `config.starting_stacks` (one entry per seat) as an alternative
+to `config.starting_stack`. Exactly one of the two must be present. Not gated behind any flag.
+
+**Why.** Two contract tests — the 3-way tiered all-in and the no-legal-raise case — were
+unreachable. The reasoning, verified against the adapter: `reset()` passes
+`tuple([starting_stack] * seats_total)` to pokerkit, so every seat starts equal. Within one hand a
+`call` matches the current bet exactly, so any two live seats have always contributed identical
+amounts and hold identical remaining capacity. Three different stack tiers therefore cannot arise,
+and neither can "two seats all-in while a third still has chips behind" — a third seat calling goes
+all-in at the same instant. Driving to unequal stacks through legal actions alone is provably
+impossible, not merely awkward.
+
+**Why it is not a test backdoor.** Unequal stacks are the ordinary state of a real table — someone
+doubles up, someone rebuys short. M1 only lacks them because it plays exactly one hand from a fresh
+room. So this is a legitimate config field that happens to unblock the tests, unlike
+`ARENA_ALLOW_FIXED_SEED`, which is a genuine test-only facility and stays flag-gated.
+
+**Consequence.** Without it, side pots — the highest-risk path in the engine and the main reason
+for depending on PokerKit — would have shipped M1 entirely unverified. Three contract tests added.
+Validation: length equals `seats`, entries integer `>= bb`, both fields present is
+`400 invalid_config`.

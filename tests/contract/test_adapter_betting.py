@@ -5,9 +5,8 @@ test_adapter_dealing.py's module docstring for why that's expected.
 
 from __future__ import annotations
 
+from packages.engine.types import Action, ActionType, SeatStatus
 from packages.game_holdem.adapter import HoldemAdapter
-
-from packages.engine.types import Action, ActionType
 
 RANKS = "23456789TJQKA"
 SUITS = "cdhs"
@@ -20,6 +19,9 @@ def _deck() -> list[str]:
 def _cfg(seats: int, **overrides: object) -> dict[str, object]:
     base: dict[str, object] = {"sb": 25, "bb": 50, "ante": 0, "starting_stack": 5000, "_seats": seats}
     base.update(overrides)
+    if "starting_stacks" in overrides:
+        # §6: exactly one of starting_stack / starting_stacks may be present.
+        base.pop("starting_stack", None)
     return base
 
 
@@ -96,9 +98,17 @@ def test_no_legal_raise_omits_raise_and_never_raises_type_error() -> None:
     Scenario: once every *other* live seat is already all-in, raising is
     illegal for whoever is left to act — there's no stack left anywhere to
     respond to a raise. Reached by having two of three seats shove their
-    whole stack, then checking the third seat's legal_actions."""
+    whole stack, then checking the third seat's legal_actions.
+
+    A uniform `starting_stack` cannot reach this: if all three seats start
+    equal, a seat facing an all-in raise can only ever call it exactly (its
+    own capacity is the same as the raiser's), so all three end up all-in
+    simultaneously and no seat is ever left with a "call, but can't raise"
+    decision. `starting_stacks` (see the side-pot test above and
+    docs/DECISIONS.md) gives the two short seats less than the third, so
+    the third can call the all-in without going all-in itself."""
     adapter = HoldemAdapter()
-    state = adapter.reset(_cfg(3, starting_stack=500), _deck())
+    state = adapter.reset(_cfg(3, starting_stacks=[100, 2000, 100]), _deck())
 
     shoves = 0
     while shoves < 2:
@@ -108,9 +118,14 @@ def test_no_legal_raise_omits_raise_and_never_raises_type_error() -> None:
         raise_spec = next((a for a in legal if a.type == ActionType.RAISE), None)
         if raise_spec is not None and raise_spec.max_to is not None:
             adapter.apply(state, seat, Action(type=ActionType.RAISE, to=raise_spec.max_to))
-            shoves += 1
         else:
             adapter.apply(state, seat, Action(type=ActionType.CALL))
+        # A short stack facing an already-all-in raise can only ever call
+        # it (its own capacity matches the raiser's, so no strictly-greater
+        # raise is legal) — count the shove by the resulting status, not by
+        # which action type produced it.
+        if adapter.view(state, seat).you.status == SeatStatus.ALL_IN:
+            shoves += 1
 
     seat = _to_act(adapter, state)
     assert seat is not None, "the seat facing two all-in opponents should still have a decision (call/fold)"

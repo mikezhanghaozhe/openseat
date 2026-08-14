@@ -437,7 +437,7 @@ class RoomStore(Generic[S]):
         except jsonschema.exceptions.ValidationError as exc:
             raise ApiError(ErrorCode.INVALID_CONFIG, exc.message) from exc
         try:
-            adapter.validate_config(config)
+            adapter.validate_config(config, seats)
         except ValueError as exc:
             # config_schema (plain JSON Schema) can't express cross-field
             # constraints like "sb < bb" — validate_config is the adapter's

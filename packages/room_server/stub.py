@@ -76,7 +76,7 @@ class StubAdapter:
             "additionalProperties": True,
         }
 
-    def validate_config(self, cfg: dict[str, object]) -> None:
+    def validate_config(self, cfg: dict[str, object], seats: int) -> None:
         pass  # no cross-field constraints beyond what config_schema already checks
 
     def reset(self, cfg: dict[str, object], deck: list[str]) -> _StubState:

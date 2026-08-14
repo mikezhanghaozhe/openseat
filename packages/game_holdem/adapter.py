@@ -75,7 +75,7 @@ class GameState:
     hand_no: int
     button: int
     seats_total: int
-    starting_stack: int
+    starting_stacks: list[int]
     sb: int
     bb: int
     ante: int
@@ -150,19 +150,46 @@ def _int(value: object) -> int:
     return value
 
 
-def _check_cross_field_config(sb: int, bb: int, ante: int, starting_stack: int) -> None:
+def _check_cross_field_config(sb: int, bb: int, ante: int) -> None:
     """The cross-field constraints `config_schema` (plain JSON Schema)
     cannot express — no `sb`/`bb` comparison keyword exists in the schema
     draft this package validates against, and the `jsonschema` build here
     has no `$data` extension (verified, not assumed). Shared between
     `validate_config` (the real gate, called at room creation) and `reset`
     (defensive only — see its call site)."""
-    if sb <= 0 or bb <= 0 or ante < 0 or starting_stack <= 0:
-        raise ValueError("sb, bb, and starting_stack must be positive; ante must be non-negative")
+    if sb <= 0 or bb <= 0 or ante < 0:
+        raise ValueError("sb and bb must be positive; ante must be non-negative")
     if sb >= bb:
         raise ValueError(f"sb ({sb}) must be less than bb ({bb})")
-    if starting_stack < bb:
-        raise ValueError(f"starting_stack ({starting_stack}) must be at least bb ({bb})")
+
+
+def _resolve_starting_stacks(cfg: dict[str, object], bb: int, seats: int) -> list[int]:
+    """§6: exactly one of `starting_stack` / `starting_stacks` must be
+    present. `starting_stacks` (docs/DECISIONS.md, "starting_stacks:
+    per-seat stacks in room config") exists because equal stacks make
+    tiered all-ins mathematically unreachable within a single hand — every
+    `call` matches the current bet exactly, so live seats always hold
+    identical capacity. Shared between `validate_config` (the real gate)
+    and `reset` (defensive only — see its call site)."""
+    has_single = "starting_stack" in cfg
+    has_list = "starting_stacks" in cfg
+    if has_single == has_list:
+        raise ValueError("exactly one of starting_stack or starting_stacks must be present")
+    if has_single:
+        starting_stack = _int(cfg["starting_stack"])
+        if starting_stack < bb:
+            raise ValueError(f"starting_stack ({starting_stack}) must be at least bb ({bb})")
+        return [starting_stack] * seats
+
+    raw = cfg["starting_stacks"]
+    if not isinstance(raw, list) or len(raw) != seats:
+        raise ValueError(f"starting_stacks must be a list of length {seats} (one entry per seat)")
+    stacks: list[int] = []
+    for entry in raw:
+        if not isinstance(entry, int) or isinstance(entry, bool) or entry < bb:
+            raise ValueError(f"every starting_stacks entry must be an integer >= bb ({bb}); got {entry!r}")
+        stacks.append(entry)
+    return stacks
 
 
 def _unstamped(event_type: EventType, payload: object) -> Event:
@@ -351,11 +378,12 @@ class HoldemAdapter:
         self.id = "holdem-nl"
         self.min_players = 2
         self.max_players = 9
-        # Structural bounds only — "sb < bb" and "starting_stack >= bb" are
-        # cross-field constraints plain JSON Schema cannot express, and the
-        # `jsonschema` build in use here has no `$data` support (verified,
-        # not assumed). See docs/DECISIONS.md for the room-server
-        # integration gap this creates and the defensive check in reset().
+        # Structural bounds only — "sb < bb", "starting_stack >= bb", and
+        # "exactly one of starting_stack/starting_stacks" are cross-field
+        # constraints plain JSON Schema cannot express, and the `jsonschema`
+        # build in use here has no `$data` support (verified, not assumed).
+        # See docs/DECISIONS.md for the room-server integration gap this
+        # creates and the defensive check in reset().
         self.config_schema: dict[str, object] = {
             "type": "object",
             "properties": {
@@ -363,13 +391,14 @@ class HoldemAdapter:
                 "bb": {"type": "integer", "exclusiveMinimum": 0},
                 "ante": {"type": "integer", "minimum": 0},
                 "starting_stack": {"type": "integer", "exclusiveMinimum": 0},
+                "starting_stacks": {"type": "array", "items": {"type": "integer"}},
                 "turn_seconds": {"type": "integer", "exclusiveMinimum": 0},
             },
-            "required": ["sb", "bb", "starting_stack"],
+            "required": ["sb", "bb"],
             "additionalProperties": False,
         }
 
-    def validate_config(self, cfg: dict[str, object]) -> None:
+    def validate_config(self, cfg: dict[str, object], seats: int) -> None:
         """Not in §9 — called by the room server at `POST /rooms`, before a
         room is created, so a config that fails only this (not
         `config_schema`) still gets `400 invalid_config` at creation time
@@ -378,24 +407,24 @@ class HoldemAdapter:
         sb = _int(cfg["sb"])
         bb = _int(cfg["bb"])
         ante = _int(cfg.get("ante", 0))
-        starting_stack = _int(cfg["starting_stack"])
-        _check_cross_field_config(sb, bb, ante, starting_stack)
+        _check_cross_field_config(sb, bb, ante)
+        _resolve_starting_stacks(cfg, bb, seats)
 
     def reset(self, cfg: dict[str, object], deck: list[str]) -> GameState:
         sb = _int(cfg["sb"])
         bb = _int(cfg["bb"])
         ante = _int(cfg.get("ante", 0))
-        starting_stack = _int(cfg["starting_stack"])
+        # `_seats` is a room-server-injected reserved key, not part of
+        # config_schema — see packages/room_server/store.py and its
+        # docs/DECISIONS.md entry on why §9's reset(cfg, deck) needs it.
+        seats_total = _int(cfg["_seats"])
         # Defensive, not the primary gate: `validate_config` above is what
         # the room server calls at POST /rooms time. This repeats the same
         # checks so a caller that invokes reset() directly (as several of
         # this package's own unit tests deliberately do) still gets a clear
         # error instead of a confusing failure deeper in pokerkit.
-        _check_cross_field_config(sb, bb, ante, starting_stack)
-        # `_seats` is a room-server-injected reserved key, not part of
-        # config_schema — see packages/room_server/store.py and its
-        # docs/DECISIONS.md entry on why §9's reset(cfg, deck) needs it.
-        seats_total = _int(cfg["_seats"])
+        _check_cross_field_config(sb, bb, ante)
+        starting_stacks = _resolve_starting_stacks(cfg, bb, seats_total)
 
         remaining_deck = list(deck)
         pk = NoLimitTexasHoldem.create_state(
@@ -404,7 +433,7 @@ class HoldemAdapter:
             ante,
             (sb, bb),
             bb,
-            tuple([starting_stack] * seats_total),
+            tuple(starting_stacks),
             seats_total,
             mode=Mode.TOURNAMENT,
         )
@@ -423,7 +452,7 @@ class HoldemAdapter:
             # docs/DECISIONS.md.
             button=seats_total - 1,
             seats_total=seats_total,
-            starting_stack=starting_stack,
+            starting_stacks=starting_stacks,
             sb=sb,
             bb=bb,
             ante=ante,
@@ -452,7 +481,7 @@ class HoldemAdapter:
         events = [
             _unstamped(
                 EventType.HAND_STARTED,
-                HandStartedPayload(hand_no=s.hand_no, button=s.button, stacks=[s.starting_stack] * s.seats_total),
+                HandStartedPayload(hand_no=s.hand_no, button=s.button, stacks=list(s.starting_stacks)),
             ),
             _unstamped(EventType.BLINDS_POSTED, BlindsPostedPayload(postings=postings)),
             _unstamped(EventType.HOLE_CARDS_DEALT, HoleCardsDealtPayload(seats=list(range(s.seats_total)))),
@@ -611,7 +640,7 @@ class HoldemAdapter:
             for i in range(s.seats_total)
         ]
 
-        committed_hand = None if s.phase == Phase.HAND_COMPLETE else s.starting_stack - pk.stacks[seat]
+        committed_hand = None if s.phase == Phase.HAND_COMPLETE else s.starting_stacks[seat] - pk.stacks[seat]
         you = YouView(
             seat=seat,
             name="",  # overlaid by the room server
@@ -651,4 +680,4 @@ class HoldemAdapter:
         return s.phase == Phase.HAND_COMPLETE
 
     def results(self, s: GameState) -> dict[int, float]:
-        return {i: float(s.pk.stacks[i] - s.starting_stack) for i in range(s.seats_total)}
+        return {i: float(s.pk.stacks[i] - s.starting_stacks[i]) for i in range(s.seats_total)}

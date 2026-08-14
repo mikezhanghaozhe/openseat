@@ -5,7 +5,7 @@ tests/contract/ is the frozen spec and is not touched here.
 
 from __future__ import annotations
 
-from pokerkit import Card, Mode, NoLimitTexasHoldem
+from pokerkit import Card
 
 from packages.engine.types import (
     Action,
@@ -15,8 +15,7 @@ from packages.engine.types import (
     PotAwardReason,
     SeatStatus,
 )
-from packages.game_holdem import cards as game_cards
-from packages.game_holdem.adapter import _AUTOMATIONS, GameState, HoldemAdapter
+from packages.game_holdem.adapter import HoldemAdapter
 
 RANKS = "23456789TJQKA"
 SUITS = "cdhs"
@@ -40,6 +39,9 @@ def _rigged_deck(*groups: str) -> list[str]:
 def _cfg(seats: int, **overrides: object) -> dict[str, object]:
     base: dict[str, object] = {"sb": 25, "bb": 50, "ante": 0, "starting_stack": 5000, "_seats": seats}
     base.update(overrides)
+    if "starting_stacks" in overrides:
+        # §6: exactly one of starting_stack / starting_stacks may be present.
+        base.pop("starting_stack", None)
     return base
 
 
@@ -376,47 +378,21 @@ def test_awards_sum_exactly_to_pot_amount_across_many_hands() -> None:
         assert abs(sum(results.values())) < 1e-9
 
 
-def _unequal_stacks_state(stacks: tuple[int, int, int]) -> GameState:
-    """Build a GameState with per-seat stacks that differ, bypassing
-    HoldemAdapter.reset() — which only accepts one uniform starting_stack
-    for the whole room, matching POST /rooms's single `starting_stack`
-    config field (§6). That's a real, load-bearing finding, not a test
-    convenience: with every seat's total hand capacity forced equal (stack
-    + already-committed bets always equals starting_stack until someone
-    actually loses chips), a genuine side pot cannot occur in ANY single
-    M1 hand reached through the normal config — confirmed by
-    test_no_raise_offered_once_every_other_live_seat_is_all_in's docstring
-    finding and reproduced by hand here first. Side pots become reachable
-    once stacks can diverge across hands (M2). See docs/DECISIONS.md."""
-    deck = _full_deck()
-    pk = NoLimitTexasHoldem.create_state(
-        _AUTOMATIONS, True, 0, (25, 50), 50, stacks, len(stacks), mode=Mode.TOURNAMENT
-    )
-    remaining = list(deck)
-    for _ in range(len(stacks)):
-        game_cards.deal_hole(pk, game_cards.draw(remaining, 2))
-    seat_status = [SeatStatus.ALL_IN if pk.stacks[i] == 0 else SeatStatus.ACTIVE for i in range(len(stacks))]
-    return GameState(
-        pk=pk,
-        hand_no=1,
-        button=len(stacks) - 1,
-        seats_total=len(stacks),
-        starting_stack=max(stacks),
-        sb=25,
-        bb=50,
-        ante=0,
-        remaining_deck=remaining,
-        full_deck=deck,
-        seat_status=seat_status,
-    )
-
-
 def test_3way_unequal_stacks_produce_more_than_one_pot_with_correct_eligibility() -> None:
     """`pk.pots` is drained by push_chips() by the time the hand is
     terminal (see docs/DECISIONS.md), so this asserts on the wire event's
-    pot count, captured before that happens."""
+    pot count, captured before that happens.
+
+    Uses `config.starting_stacks` (docs/PROTOCOL.md §6, docs/DECISIONS.md
+    "starting_stacks: per-seat stacks in room config") to reach unequal
+    stacks through `reset()` directly rather than hand-building a
+    `GameState` — with a uniform `starting_stack`, every seat's total hand
+    capacity is forced equal (stack + already-committed bets == the same
+    starting_stack for everyone until someone actually loses chips), so a
+    genuine side pot is mathematically unreachable in any single M1 hand,
+    which is exactly the gap `starting_stacks` closes."""
     adapter = HoldemAdapter()
-    s = _unequal_stacks_state((100, 300, 300))
+    s = adapter.reset(_cfg(3, starting_stacks=[100, 300, 300]), _full_deck())
     events = _shove_everyone(adapter, s, 3)
     pot_awarded = next(e for e in events if e.type == EventType.POT_AWARDED)
     assert len(pot_awarded.payload.pots) > 1, "unequal all-in stacks should split into more than one pot tier"

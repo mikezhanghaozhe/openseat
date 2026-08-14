@@ -341,11 +341,28 @@ Base path `/v1`. All bodies JSON. All responses include `protocol_version`.
 // request
 { "game": "holdem-nl", "seats": 4,
   "config": { "sb": 25, "bb": 50, "ante": 0, "starting_stack": 5000, "turn_seconds": 30 },
+  // or: "starting_stacks": [5000, 1200, 300, 5000] — see below
   "seed": 42 }
 // 201
 { "room_id": "r_8fk2", "invite_token": "inv_...", "host_token": "hst_...",
   "seats": [{ "index": 0, "status": "open" }, ...] }
 ```
+**Stacks may be unequal.** `config.starting_stack` sets every seat's stack. `config.starting_stacks`
+(a list, one entry per seat) overrides it per seat. Exactly one of the two must be present.
+
+```jsonc
+"config": { "sb": 25, "bb": 50, "starting_stacks": [5000, 1200, 300, 5000] }
+```
+
+This is a normal table state, not a test facility — real tables have unequal stacks as soon as
+anyone doubles up or rebuys short. It exists in M1 because a single hand from a fresh room cannot
+otherwise reach one: with equal stacks, every live seat has contributed the same amount at every
+point, so tiered all-ins and side pots are mathematically unreachable. Without it the side-pot path
+— the highest-risk code in the engine — could not be tested at all.
+
+Validation: length equals `seats`; every entry is an integer `>= bb`; both fields present is
+`400 invalid_config`.
+
 **Config is validated server-side before anything is created.** `config` is checked against the
 adapter's `config_schema` and `seats` against `min_players`/`max_players`; violations return
 `400 invalid_config` naming the specific constraint. `config_schema` defines what is *legal*, not
@@ -671,5 +688,9 @@ answer. 52 strings per hand is not worth optimising away.
 - [ ] Deriving `pots[]` and `pot_total` uses one materialized `tuple(state.pots)`
 - [ ] After a 3-way preflop all-in, the board is fully dealt and every live hand exposed
 - [ ] `POST /rooms` with `sb >= bb`, `seats` out of range, or `starting_stack < bb` → 400
+- [ ] `starting_stacks` of the wrong length, with an entry `< bb`, or supplied alongside
+      `starting_stack` → `400 invalid_config`
+- [ ] Unequal stacks reach a 3-way all-in with three tiers: `pots[]` has more than one entry,
+      `eligible_seats` is correct per tier, and each pot's `awards[]` sums to its `amount`
 - [ ] No M1 payload contains `sitting_out`, `busted`, `room_complete`, or `seat_left`
 - [ ] Event order for each transition matches §5.0 exactly

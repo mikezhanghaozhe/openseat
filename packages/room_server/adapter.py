@@ -36,16 +36,20 @@ class GameAdapter(Protocol[S]):
     max_players: int
     config_schema: dict[str, object]
 
-    def validate_config(self, cfg: dict[str, object]) -> None:
+    def validate_config(self, cfg: dict[str, object], seats: int) -> None:
         """Not in §9. Raise `ValueError` with a human-readable reason if
         `cfg` is semantically invalid in a way `config_schema` (plain JSON
         Schema) cannot express — e.g. a cross-field constraint like `sb <
-        bb`. Called by the room server at `POST /rooms`, after
-        `config_schema` validation and before the room is created (§6:
-        "A bad config must fail here, not crash inside reset() far from the
-        cause"). Must not raise for any `cfg` that already satisfies
-        `config_schema` and has no cross-field problems — this is
-        additive, not a second pass at what the schema already checks."""
+        bb`, or `starting_stacks` length against the seat count. Called by
+        the room server at `POST /rooms`, after `config_schema` validation
+        and before the room is created (§6: "A bad config must fail here,
+        not crash inside reset() far from the cause"). `seats` is passed
+        separately because it isn't part of `cfg` at this point — `_seats`
+        is only injected into the config dict later, at `/start` (see
+        `reset()` and docs/DECISIONS.md). Must not raise for any `cfg` that
+        already satisfies `config_schema` and has no cross-field problems —
+        this is additive, not a second pass at what the schema already
+        checks."""
         ...
 
     def reset(self, cfg: dict[str, object], deck: list[str]) -> S:
