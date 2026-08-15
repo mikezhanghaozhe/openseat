@@ -929,3 +929,38 @@ uncollected-bets number just moved from one existing field to the other, no new 
 field. `pot_total` is provably unchanged at the instant a street closes and PokerKit sweeps `bets`
 into `pots` — same chips, relabeled — pinned by
 `test_pot_total_is_unchanged_when_a_street_closes_and_bets_sweep_into_pots`.
+
+## 2026-08-14 — agent-runtime: new package, `decide()` + `ModelSeatDriver`, OpenRouter only
+
+Built `packages/agent_runtime/` for M3's `kind: "model"` seats: `decide(observation, config) ->
+Decision` calls OpenRouter with tool calling (never regex on prose), validates the returned action
+against that decision's own `legal_actions`, retries up to twice on an invalid/failed call, and
+falls back to `check` if legal else `fold` on exhaustion — logging every violation and every
+fallback. `ModelSeatDriver` wraps it in a poll loop against `arena_client.RoomClient`, since M1 has
+no WebSocket (§8 is M2) — there is no push channel to react to `to_act` yet.
+
+**Talks to the room only through `arena_client`, not a new HTTP layer.** The ownership map already
+names `arena-client` as shared infrastructure for "tests, model seats, MCP bridge" — reimplementing
+REST calls here would duplicate `RoomClient` and drift from its retry/error semantics for no
+reason.
+
+**The tool-calling schema's `type` enum is built per-call from that observation's `legal_actions`,
+not a fixed fold/check/call/raise/show/muck enum.** This doesn't replace validation — a model can
+still return an out-of-range `to` for a legal raise type, which the schema can't express — but it
+does make an entire class of invalid response (naming an action that isn't on offer at all)
+unrepresentable rather than merely rejected.
+
+**Renamed the policy module `decide.py` → `policy.py` before it shipped.** The package's public
+`decide` function and its `decide` submodule shared a name; `packages/agent_runtime/__init__.py`
+re-exporting `from packages.agent_runtime.decide import decide` overwrites the `decide` attribute
+on the `agent_runtime` package with the function, so `import packages.agent_runtime.decide`
+resolves to the function, not the module — `sys.modules` still has the real module, but attribute
+access doesn't. Caught by a test trying to monkeypatch `call_openrouter` on "the module" and getting
+it patched onto a function object instead. Renaming the file sidesteps the trap entirely rather than
+routing every future access through `importlib.import_module`.
+
+**Did not touch `room_server`.** Nothing currently invokes a model seat automatically when it
+becomes `to_act` — `POST /rooms/{id}/seats` doesn't yet accept `model`/`key_mode`/`api_key` (M3,
+§ ownership: `room_server` is human-only). `ModelSeatDriver` is complete and independently testable
+against `arena_client`, but wiring "seat claimed as kind=model ⇒ a driver starts running" is a
+`room_server` change and is flagged here rather than reached across.

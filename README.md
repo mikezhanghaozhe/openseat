@@ -37,6 +37,88 @@ document disagree, the document is right.
 | Your own bot | `pip install arena-client`, connect with a seat token |
 | Your assistant | Point an MCP client at the room's MCP endpoint |
 
+## Running locally
+
+Two terminals.
+
+**Terminal 1 — backend**
+
+```bash
+pip install -r requirements.txt
+uvicorn packages.room_server.main:app --reload --port 8000
+```
+
+Room server on `http://localhost:8000`.
+
+**Terminal 2 — frontend**
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+Table UI on `http://localhost:5173`.
+
+Create `web/.env.local` (gitignored) with:
+
+```
+VITE_API_BASE=http://localhost:8000
+```
+
+**Playing with two people locally:** `seat_token` is stored in `localStorage`, keyed by
+`room_id`. Two tabs in the same browser share `localStorage`, so the second tab overwrites the
+first tab's seat. Use a normal window for one seat and an incognito/private window for the other.
+
+**Fastest smoke test** — create a room, claim a seat, start, fetch a view:
+
+```bash
+ROOM_JSON=$(curl -s http://localhost:8000/v1/rooms -X POST -H "Content-Type: application/json" \
+  -d '{"game":"holdem-nl","seats":2,"config":{"sb":25,"bb":50,"starting_stack":5000,"turn_seconds":30}}')
+ROOM_ID=$(echo "$ROOM_JSON" | jq -r .room_id)
+INVITE=$(echo "$ROOM_JSON" | jq -r .invite_token)
+HOST=$(echo "$ROOM_JSON" | jq -r .host_token)
+
+SEAT_JSON=$(curl -s http://localhost:8000/v1/rooms/$ROOM_ID/seats -X POST -H "Content-Type: application/json" \
+  -d "{\"invite_token\":\"$INVITE\",\"kind\":\"human\",\"display_name\":\"mike\"}")
+SEAT_TOKEN=$(echo "$SEAT_JSON" | jq -r .seat_token)
+
+curl -s http://localhost:8000/v1/rooms/$ROOM_ID/seats -X POST -H "Content-Type: application/json" \
+  -d "{\"invite_token\":\"$INVITE\",\"kind\":\"human\",\"display_name\":\"alex\"}" > /dev/null
+
+curl -s http://localhost:8000/v1/rooms/$ROOM_ID/start -X POST -H "Content-Type: application/json" \
+  -d "{\"host_token\":\"$HOST\"}"
+
+curl -s http://localhost:8000/v1/rooms/$ROOM_ID/view -H "Authorization: Bearer $SEAT_TOKEN"
+```
+
+## Deploying
+
+Backend on Render, frontend on Vercel.
+
+**Render (backend)** — see `render.yaml`:
+
+```
+buildCommand: pip install -r requirements.txt
+startCommand: uvicorn packages.room_server.main:app --host 0.0.0.0 --port $PORT
+```
+
+Both `--host 0.0.0.0` and `--port $PORT` are required — Render routes traffic to `$PORT`, and the
+default `uvicorn` host (`127.0.0.1`) is not reachable from outside the container.
+
+**Vercel (frontend)** — set `VITE_API_BASE` to the Render URL in the Vercel project's environment
+variables **before the first build**. Vite inlines `import.meta.env.*` values at build time, not
+runtime — a build made without `VITE_API_BASE` set produces a frontend permanently calling
+`undefined`, and redeploying without a rebuild won't fix it.
+
+**Known limits — not bugs:**
+
+- All state is in memory (`RoomStore` holds it in the process). A restart or redeploy drops every
+  room.
+- Render's free tier sleeps after ~15 minutes idle and takes ~30s to wake. Hit the URL before
+  demoing.
+- CORS is `allow_origins=["*"]` in `packages/room_server/main.py`. Demo-only.
+
 ## Repository layout
 
 ```
