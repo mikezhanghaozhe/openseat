@@ -40,17 +40,20 @@ document disagree, the document is right.
 ## Repository layout
 
 ```
-packages/engine/         GameAdapter protocol, event log, seeded RNG, redaction
-packages/game-holdem/    PokerKit adapter — the only place poker rules live
-packages/arena-client/   HTTP + WebSocket client
-packages/agent-runtime/  Provider adapters, action validation, retry
-packages/room-server/    FastAPI rooms, tokens, turn clock, broadcast
-packages/mcp-seat/       MCP server exposing a seat as tools
-web/                     React table UI
+packages/engine/         Shared types every package imports — no logic, just dataclasses
+packages/room_server/    FastAPI rooms, tokens, turn order, broadcast
+packages/game_holdem/    PokerKit adapter — the only place poker rules live
+packages/arena_client/   HTTP client (WebSocket arrives in M2)
+packages/agent-runtime/  Provider adapters, action validation, retry — not built yet (M3)
+packages/mcp-seat/       MCP server exposing a seat as tools — not built yet (M5)
+web/                     React table UI — not built yet (M4)
 docs/PROTOCOL.md         Wire protocol — read this first
 docs/DECISIONS.md        Append-only log of non-obvious choices
 tests/contract/          The spec as executable tests
 ```
+
+See `packages/README.md` for how the four existing packages fit together and why none of them
+import each other's internals.
 
 ## Contributing
 
