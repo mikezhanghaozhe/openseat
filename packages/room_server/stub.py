@@ -43,6 +43,7 @@ _PLACEHOLDER_TS = 0
 
 
 def _placeholder_event(event_type: EventType, payload: object) -> Event:
+    """Build an `Event` with placeholder `seq`/`ts`, stamped later by the room server."""
     return Event(seq=_PLACEHOLDER_SEQ, type=event_type, ts=_PLACEHOLDER_TS, payload=payload)  # type: ignore[arg-type]
 
 
@@ -64,6 +65,8 @@ class StubAdapter:
     # declares these as plain (non-`ClassVar`) members, and a `ClassVar`
     # implementation fails structural matching under `mypy --strict`.
     def __init__(self) -> None:
+        """Set the adapter's protocol identity and its `config_schema`
+        (`rounds`, required; `starting_stack`, optional, defaults to 1000 in `reset`)."""
         self.id = "stub"
         self.min_players = 2
         self.max_players = 8
@@ -78,9 +81,17 @@ class StubAdapter:
         }
 
     def validate_config(self, cfg: dict[str, object], seats: int) -> None:
-        pass  # no cross-field constraints beyond what config_schema already checks
+        """No cross-field constraints beyond what `config_schema` already checks."""
+        pass
 
     def reset(self, cfg: dict[str, object], deck: list[str]) -> _StubState:
+        """Start a new stub "hand": every seat active, seat 0 to act first,
+        `rounds` full laps of the table before it force-ends.
+
+        Args:
+            cfg: room config; must include `rounds` and the room-server-injected `_seats`.
+            deck: unused — the stub game deals no cards.
+        """
         raw_rounds = cfg["rounds"]
         assert isinstance(raw_rounds, int)
         rounds = raw_rounds
@@ -104,6 +115,8 @@ class StubAdapter:
         )
 
     def setup_events(self, s: _StubState) -> list[Event]:
+        """The hand-start event sequence: `hand_started`, `hole_cards_dealt`
+        (no real cards, just marks active seats), and the first `action_required`."""
         return [
             _placeholder_event(
                 EventType.HAND_STARTED,
@@ -120,11 +133,18 @@ class StubAdapter:
         ]
 
     def legal_actions(self, s: _StubState, seat: int) -> list[ActionSpec]:
+        """Only `check` or `fold` are ever legal, and only for `s.to_act` while the hand is live."""
         if s.phase == Phase.HAND_COMPLETE or s.to_act != seat or seat not in s.active:
             return []
         return [ActionSpec(type=ActionType.CHECK), ActionSpec(type=ActionType.FOLD)]
 
     def apply(self, s: _StubState, seat: int, a: Action) -> list[Event]:
+        """Validate and apply `seat`'s check/fold, advancing to the next
+        active seat or ending the hand if only one seat (or `rounds`) remains.
+
+        Raises:
+            IllegalAction: if `a.type` isn't currently legal for `seat`.
+        """
         legal = self.legal_actions(s, seat)
         if a.type not in {spec.type for spec in legal}:
             raise IllegalAction(f"{a.type.value} is not legal for seat {seat}", legal)
@@ -168,6 +188,7 @@ class StubAdapter:
         return events
 
     def _next_active(self, s: _StubState, seat: int) -> int:
+        """Find the next active seat after `seat`, wrapping around the table; falls back to `seat` itself."""
         for offset in range(1, s.seats_total + 1):
             candidate = (seat + offset) % s.seats_total
             if candidate in s.active:
@@ -175,6 +196,8 @@ class StubAdapter:
         return seat
 
     def _end_hand(self, s: _StubState, events: list[Event]) -> None:
+        """Close the hand: mark it complete, award the (zero-chip) pot to
+        the lowest-indexed active seat, and append the closing events."""
         winner = min(s.active) if s.active else 0
         s.phase = Phase.HAND_COMPLETE
         s.to_act = None
@@ -201,6 +224,8 @@ class StubAdapter:
         )
 
     def view(self, s: _StubState, seat: int) -> Observation:
+        """Build the redacted `Observation` for `seat` (the stub game has no
+        hidden info, so there's nothing to actually redact)."""
         seats = [
             SeatView(
                 seat=i,
@@ -244,6 +269,7 @@ class StubAdapter:
         )
 
     def waiting_view(self, cfg: dict[str, object], seats: list[SeatJoinedPayload], seat: int) -> Observation:
+        """The placeholder `Observation` shown to `seat` before the hand has started."""
         seat_views = [
             SeatView(
                 seat=s.seat,
@@ -288,7 +314,9 @@ class StubAdapter:
         )
 
     def is_terminal(self, s: _StubState) -> bool:
+        """Whether the stub hand has finished resolving."""
         return s.phase == Phase.HAND_COMPLETE
 
     def results(self, s: _StubState) -> dict[int, float]:
+        """1.0 for each still-active seat, 0.0 for folded seats, keyed by seat index."""
         return {i: (1.0 if i in s.active else 0.0) for i in range(s.seats_total)}

@@ -13,6 +13,20 @@ from enum import Enum
 
 
 def to_wire(obj: object) -> object:
+    """Recursively convert a dataclass/Enum/list/tuple/dict tree into plain
+    JSON-safe Python values (dict/list/str/int/float/bool/None).
+
+    Args:
+        obj: any value — a dataclass instance, Enum member, list/tuple,
+            dict, or plain JSON-safe scalar; nested structures are walked
+            recursively.
+
+    Returns:
+        The JSON-safe equivalent. Dataclass fields whose value is `None`
+        are omitted from the output dict entirely (see module docstring);
+        Enum members become their `.value`; everything else is recursed
+        into or returned unchanged.
+    """
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         result: dict[str, object] = {}
         for f in dataclasses.fields(obj):
@@ -31,6 +45,14 @@ def to_wire(obj: object) -> object:
 
 
 def to_wire_dict(obj: object) -> dict[str, object]:
+    """`to_wire`, narrowed to a dict return for callers (e.g. FastAPI route
+    handlers) that need a JSON object body, not any JSON-safe value.
+
+    Args:
+        obj: a dataclass instance expected to serialize to a dict at the
+            top level (any other input that produces a non-dict result
+            trips the assertion).
+    """
     result = to_wire(obj)
     assert isinstance(result, dict)
     return result

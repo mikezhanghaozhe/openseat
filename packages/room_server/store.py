@@ -59,14 +59,18 @@ PROTOCOL_VERSION = "0.1"
 
 
 def _now_ms() -> int:
+    """Current wall-clock time in milliseconds, used to stamp events' `ts`."""
     return int(time.time() * 1000)
 
 
 def _fresh_deck() -> list[str]:
+    """A standard 52-card deck, in a fixed unshuffled rank/suit order (as
+    two-character strings like `"As"`)."""
     return [rank + suit for suit in _SUITS for rank in _RANKS]
 
 
 def _shuffled_deck(rng: random.Random) -> list[str]:
+    """A fresh deck shuffled in place by `rng` (invariant 3: the room's seeded RNG)."""
     deck = _fresh_deck()
     rng.shuffle(deck)
     return deck
@@ -88,6 +92,10 @@ class IdempotencyRecord:
 
 
 class Room(Generic[S]):
+    """One live room: its seats, bearer tokens, event log, and the adapter
+    state `S` it drives (opaque here — see the CRITICAL BOUNDARY note in
+    `adapter.py`). All mutation goes through `self.lock` (invariant 6)."""
+
     def __init__(
         self,
         room_id: str,
@@ -97,6 +105,15 @@ class Room(Generic[S]):
         seats_total: int,
         room_seed: int,
     ) -> None:
+        """
+        Args:
+            room_id: this room's public id.
+            game: the game adapter id this room was created for.
+            adapter: the `GameAdapter` instance driving hand logic for this room.
+            config: the game-specific config, already validated at creation time.
+            seats_total: number of seats to create (all "open" until claimed).
+            room_seed: the RNG seed this room's deck shuffles derive from (never serialized).
+        """
         self.room_id = room_id
         self.game = game
         self.adapter = adapter
@@ -117,24 +134,35 @@ class Room(Generic[S]):
     # -- internal helpers, only ever called while `self.lock` is held ------
 
     def _emit(self, event_type: EventType, payload: Payload) -> Event:
+        """Build a brand-new event, assign it the room's next `seq`, append
+        it to the log, and return it. Use for events the store itself
+        originates (e.g. `ROOM_CREATED`, `SEAT_JOINED`)."""
         self.seq += 1
         ev = Event(seq=self.seq, type=event_type, ts=_now_ms(), payload=payload)
         self.events.append(ev)
         return ev
 
     def _stamp(self, unstamped: Event) -> Event:
+        """Assign a real `seq`/`ts` to an adapter-produced placeholder event
+        (invariant 5: `seq` is monotonic per room, assigned only here), append it, and return it."""
         self.seq += 1
         ev = replace(unstamped, seq=self.seq, ts=_now_ms())
         self.events.append(ev)
         return ev
 
     def _seat_by_token(self, seat_token: str | None) -> SeatSlot:
+        """Resolve a bearer `seat_token` to its claimed `SeatSlot`.
+
+        Raises:
+            ApiError: `INVALID_TOKEN` if the token is missing or doesn't match any claimed seat.
+        """
         for slot in self.seats:
             if slot.status == "claimed" and tokens_equal(seat_token, slot.seat_token):
                 return slot
         raise ApiError(ErrorCode.INVALID_TOKEN, "seat_token missing, unknown, or for another room")
 
     def _chat(self) -> list[ChatMessage]:
+        """Derive the full table-talk history by scanning the event log for `TABLE_TALK` events."""
         chat: list[ChatMessage] = []
         for ev in self.events:
             if isinstance(ev.payload, TableTalkPayload):
@@ -142,6 +170,9 @@ class Room(Generic[S]):
         return chat
 
     def _overlay_seat_metadata(self, seats: list[SeatView]) -> list[SeatView]:
+        """Fill in each `SeatView`'s `kind`/`name` from this room's
+        join-time metadata — fields the adapter's `view()` cannot know
+        (see `GameAdapter.view` docstring)."""
         by_index = {s.index: s for s in self.seats}
         out: list[SeatView] = []
         for sv in seats:
@@ -152,6 +183,9 @@ class Room(Generic[S]):
         return out
 
     def _overlay(self, obs: Observation) -> Observation:
+        """Fill in the room-server-owned envelope fields an adapter's `Observation`
+        cannot know on its own: `protocol_version`, `seq`, `room_id`, seat
+        metadata, and `chat`."""
         slot = self.seats[obs.you.seat]
         you = obs.you
         if slot.name is not None:
@@ -167,6 +201,8 @@ class Room(Generic[S]):
         )
 
     def _claimed_seats(self) -> list[SeatJoinedPayload]:
+        """Every currently-claimed seat's join-time metadata, for
+        `GameAdapter.waiting_view` before the hand has started."""
         return [
             SeatJoinedPayload(seat=s.index, name=s.name, kind=s.kind)
             for s in self.seats
@@ -178,6 +214,18 @@ class Room(Generic[S]):
     async def claim_seat(
         self, invite_token: str | None, seat_index: int | None, kind: str, display_name: str
     ) -> SeatSlot:
+        """Claim an open seat (or a specific `seat_index`) for a new player,
+        issuing its bearer `seat_token`.
+
+        Args:
+            invite_token: must match the room's `invite_token`.
+            seat_index: specific seat to claim; if None, the first open seat is used.
+            kind: seat kind string (e.g. "human"/"model"); must parse as a `SeatKind`.
+            display_name: name to show for this seat.
+
+        Raises:
+            ApiError: `INVALID_TOKEN`, `BAD_REQUEST` (bad kind or index), `SEAT_TAKEN`, or `ROOM_FULL`.
+        """
         async with self.lock:
             if not tokens_equal(invite_token, self.invite_token):
                 raise ApiError(ErrorCode.INVALID_TOKEN, "invalid invite_token")
@@ -204,6 +252,18 @@ class Room(Generic[S]):
             return slot
 
     async def start(self, host_token: str | None) -> dict[str, object]:
+        """Host-only: begin play once every seat is claimed — shuffle the
+        deck from `room_seed`, call `adapter.reset`, and emit the hand-start
+        events from `adapter.setup_events`. Idempotent: a second call with
+        the same host_token after the room has started returns the same
+        cached `start_response` rather than starting a second hand.
+
+        Args:
+            host_token: must match the room's `host_token`.
+
+        Raises:
+            ApiError: `INVALID_TOKEN` or `SEATS_NOT_FILLED`.
+        """
         async with self.lock:
             if not tokens_equal(host_token, self.host_token):
                 raise ApiError(ErrorCode.INVALID_TOKEN, "invalid host_token")
@@ -244,6 +304,20 @@ class Room(Generic[S]):
         action: Action,
         table_talk: str | None,
     ) -> dict[str, object]:
+        """Validate and apply one action for the seat owning `seat_token`.
+
+        Args:
+            seat_token: bearer token identifying the acting seat.
+            request_id: idempotency key — a retry with the same id and the
+                same action returns the original response (`replayed: True`)
+                instead of re-applying it; the same id with a *different*
+                action is a client bug and raises `REQUEST_ID_CONFLICT`.
+            action: the submitted action; validated against `legal_actions` before being applied.
+            table_talk: optional chat text to emit alongside the action.
+
+        Raises:
+            ApiError: `REQUEST_ID_CONFLICT`, `ROOM_CLOSED`, `NOT_YOUR_TURN`, or `ILLEGAL_ACTION`.
+        """
         async with self.lock:
             seat = self._seat_by_token(seat_token)
 
@@ -307,6 +381,12 @@ class Room(Generic[S]):
             return response
 
     async def view(self, seat_token: str | None) -> Observation:
+        """The redacted `Observation` for the seat owning `seat_token` —
+        `waiting_view` before the hand has started, `view` afterward.
+
+        Raises:
+            ApiError: `INVALID_TOKEN` if `seat_token` doesn't match a claimed seat.
+        """
         async with self.lock:
             seat = self._seat_by_token(seat_token)
             if self.state is None:
@@ -316,11 +396,19 @@ class Room(Generic[S]):
             return self._overlay(obs)
 
     async def events_since(self, since: int) -> tuple[list[Event], int]:
+        """Events with `seq` strictly greater than `since`, plus the room's
+        current `seq` (`latest_seq`) — the polling/reconnect primitive (invariant 5)."""
         async with self.lock:
             latest = self.seq
             return [ev for ev in self.events if ev.seq > since], latest
 
     async def result(self) -> dict[str, object]:
+        """The outcome of the most recently completed hand: pot awards,
+        final stacks, and any showdown reveals.
+
+        Raises:
+            ApiError: `HAND_IN_PROGRESS` if no hand has completed yet.
+        """
         async with self.lock:
             hand_complete = next((ev for ev in reversed(self.events) if ev.type == EventType.HAND_COMPLETE), None)
             if hand_complete is None:
@@ -337,6 +425,8 @@ class Room(Generic[S]):
             }
 
     async def summary(self) -> dict[str, object]:
+        """The room's lobby-level summary: game id, phase, seats, hand
+        number, and overall room status — no redacted table state included."""
         async with self.lock:
             if self.state is not None:
                 obs = self.adapter.view(self.state, 0)
@@ -364,19 +454,29 @@ class Room(Generic[S]):
 
 
 def _pots_of(ev: Event) -> list[PotAward]:
+    """The pot awards carried by `ev` if it's a `POT_AWARDED` event, else `[]`."""
     if isinstance(ev.payload, PotAwardedPayload):
         return list(ev.payload.pots)
     return []
 
 
 def _reveals_of(ev: Event) -> list[Reveal]:
+    """The hole-card reveals carried by `ev` if it's a `SHOWDOWN` event, else `[]`."""
     if isinstance(ev.payload, ShowdownPayload):
         return list(ev.payload.reveals)
     return []
 
 
 class RoomStore(Generic[S]):
+    """Registry of all live `Room`s, keyed by room id. Owns room creation
+    (including config validation) and lookup; per-room mutation lives on `Room` itself."""
+
     def __init__(self, adapters: dict[str, GameAdapter[S]], allow_fixed_seed: bool) -> None:
+        """
+        Args:
+            adapters: game-id -> `GameAdapter` registry available for room creation.
+            allow_fixed_seed: whether `create_room` may accept a caller-supplied RNG seed.
+        """
         self._adapters = adapters
         self._allow_fixed_seed = allow_fixed_seed
         self._rooms: dict[str, Room[S]] = {}
@@ -385,6 +485,19 @@ class RoomStore(Generic[S]):
     async def create_room(
         self, game: str, seats: int, config: dict[str, object], seed: int | None
     ) -> Room[S]:
+        """Validate `config` against the `game` adapter and create a new,
+        empty (all seats open) `Room`.
+
+        Args:
+            game: game adapter id; must be registered in `self._adapters`.
+            seats: seat count; must be within the adapter's min/max players.
+            config: game-specific config; checked against `config_schema` then `adapter.validate_config`.
+            seed: optional fixed RNG seed for the room's deck shuffles; only
+                accepted if this store was built with `allow_fixed_seed=True`.
+
+        Raises:
+            ApiError: `BAD_REQUEST` (unknown game or disallowed seed) or `INVALID_CONFIG`.
+        """
         adapter = self._adapters.get(game)
         if adapter is None:
             raise ApiError(ErrorCode.BAD_REQUEST, f"unknown game {game!r}")
@@ -429,6 +542,11 @@ class RoomStore(Generic[S]):
         return room
 
     def get(self, room_id: str) -> Room[S]:
+        """Look up a room by id.
+
+        Raises:
+            ApiError: `ROOM_NOT_FOUND` if no room with `room_id` exists.
+        """
         room = self._rooms.get(room_id)
         if room is None:
             raise ApiError(ErrorCode.ROOM_NOT_FOUND, "no such room")

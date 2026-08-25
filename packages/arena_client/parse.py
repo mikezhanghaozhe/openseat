@@ -63,34 +63,40 @@ from packages.engine.types import (
 
 
 def as_dict(value: object) -> dict[str, object]:
+    """Assert `value` is a JSON object and return it typed as `dict[str, object]`."""
     assert isinstance(value, dict), f"expected an object, got {type(value).__name__}"
     return value
 
 
 def as_list(value: object) -> list[object]:
+    """Assert `value` is a JSON array and return it typed as `list[object]`."""
     assert isinstance(value, list), f"expected an array, got {type(value).__name__}"
     return value
 
 
 def req_str(d: dict[str, object], key: str) -> str:
+    """Read a required string field `key` from `d`; asserts if absent or the wrong type."""
     value = d[key]
     assert isinstance(value, str), f"{key!r}: expected a string, got {type(value).__name__}"
     return value
 
 
 def req_int(d: dict[str, object], key: str) -> int:
+    """Read a required integer field `key` from `d`; asserts if absent or the wrong type."""
     value = d[key]
     assert isinstance(value, int), f"{key!r}: expected an integer, got {type(value).__name__}"
     return value
 
 
 def req_bool(d: dict[str, object], key: str) -> bool:
+    """Read a required boolean field `key` from `d`; asserts if absent or the wrong type."""
     value = d[key]
     assert isinstance(value, bool), f"{key!r}: expected a boolean, got {type(value).__name__}"
     return value
 
 
 def opt_int(d: dict[str, object], key: str) -> int | None:
+    """Read an optional integer field `key` from `d`; missing/`None` yields `None`."""
     value = d.get(key)
     if value is None:
         return None
@@ -99,6 +105,7 @@ def opt_int(d: dict[str, object], key: str) -> int | None:
 
 
 def opt_str(d: dict[str, object], key: str) -> str | None:
+    """Read an optional string field `key` from `d`; missing/`None` yields `None`."""
     value = d.get(key)
     if value is None:
         return None
@@ -107,23 +114,28 @@ def opt_str(d: dict[str, object], key: str) -> str | None:
 
 
 def req_list_str(d: dict[str, object], key: str) -> list[str]:
+    """Read field `key` from `d` as a list of strings; missing yields an empty list."""
     return [_expect_str(item) for item in as_list(d.get(key, []))]
 
 
 def req_list_int(d: dict[str, object], key: str) -> list[int]:
+    """Read field `key` from `d` as a list of integers; missing yields an empty list."""
     return [_expect_int(item) for item in as_list(d.get(key, []))]
 
 
 def req_dict(d: dict[str, object], key: str) -> dict[str, object]:
+    """Read a required nested object field `key` from `d`."""
     return as_dict(d[key])
 
 
 def _expect_str(value: object) -> str:
+    """Assert a single list element is a string (helper for `req_list_str`)."""
     assert isinstance(value, str)
     return value
 
 
 def _expect_int(value: object) -> int:
+    """Assert a single list element is an integer (helper for `req_list_int`)."""
     assert isinstance(value, int)
     return value
 
@@ -132,10 +144,13 @@ def _expect_int(value: object) -> int:
 
 
 def parse_action(d: dict[str, object]) -> Action:
+    """Parse the wire form of a seat's submitted action (§3): its `type` and, for raises, `to`."""
     return Action(type=ActionType(req_str(d, "type")), to=opt_int(d, "to"))
 
 
 def parse_action_spec(d: dict[str, object]) -> ActionSpec:
+    """Parse one legal-action description (§3): its `type` and, depending on
+    type, `amount`/`min_to`/`max_to` bounds."""
     return ActionSpec(
         type=ActionType(req_str(d, "type")),
         amount=opt_int(d, "amount"),
@@ -148,10 +163,12 @@ def parse_action_spec(d: dict[str, object]) -> ActionSpec:
 
 
 def parse_pot_view(d: dict[str, object]) -> PotView:
+    """Parse one pot's redacted view (§4): its `index`, chip `amount`, and `eligible_seats`."""
     return PotView(index=req_int(d, "index"), amount=req_int(d, "amount"), eligible_seats=req_list_int(d, "eligible_seats"))
 
 
 def parse_reveal(d: dict[str, object]) -> Reveal:
+    """Parse a shown-down seat's revealed hole cards and hand-rank description."""
     return Reveal(
         seat=req_int(d, "seat"),
         hole=req_list_str(d, "hole"),
@@ -161,6 +178,8 @@ def parse_reveal(d: dict[str, object]) -> Reveal:
 
 
 def parse_you_view(d: dict[str, object]) -> YouView:
+    """Parse the caller's own seat view (§4) — the one seat whose hole cards
+    are unredacted in the returned `Observation`."""
     return YouView(
         seat=req_int(d, "seat"),
         name=req_str(d, "name"),
@@ -173,6 +192,7 @@ def parse_you_view(d: dict[str, object]) -> YouView:
 
 
 def parse_seat_view(d: dict[str, object]) -> SeatView:
+    """Parse one other seat's redacted view (§4) — no hole cards unless `revealed`."""
     last_action_raw = d.get("last_action")
     revealed_raw = d.get("revealed")
     return SeatView(
@@ -188,10 +208,14 @@ def parse_seat_view(d: dict[str, object]) -> SeatView:
 
 
 def parse_chat_message(d: dict[str, object]) -> ChatMessage:
+    """Parse one table-talk chat line, tagged with the `seq` it was posted at."""
     return ChatMessage(seq=req_int(d, "seq"), seat=req_int(d, "seat"), name=req_str(d, "name"), text=req_str(d, "text"))
 
 
 def parse_observation(d: dict[str, object]) -> Observation:
+    """Parse the full redacted table view (§4) returned by `GET /rooms/{id}` —
+    the whole point of `GameAdapter.view`: everything a given seat is
+    allowed to see, nothing more."""
     return Observation(
         protocol_version=req_str(d, "protocol_version"),
         seq=req_int(d, "seq"),
@@ -218,14 +242,19 @@ def parse_observation(d: dict[str, object]) -> Observation:
 
 
 def parse_posting(d: dict[str, object]) -> Posting:
+    """Parse one forced-bet posting (§5, `blinds_posted`): which `seat` posted
+    how much `amount`, and what `kind` (SB, BB, or ante)."""
     return Posting(seat=req_int(d, "seat"), amount=req_int(d, "amount"), kind=PostingKind(req_str(d, "kind")))
 
 
 def parse_award(d: dict[str, object]) -> Award:
+    """Parse a single seat's share of one pot (§5, `pot_awarded`)."""
     return Award(seat=req_int(d, "seat"), amount=req_int(d, "amount"))
 
 
 def parse_pot_award(d: dict[str, object]) -> PotAward:
+    """Parse one pot's full award breakdown (§5, `pot_awarded`): its
+    `index`/`amount`, the per-seat `awards`, and the `reason` it was won."""
     return PotAward(
         index=req_int(d, "index"),
         amount=req_int(d, "amount"),
@@ -235,6 +264,18 @@ def parse_pot_award(d: dict[str, object]) -> PotAward:
 
 
 def parse_payload(event_type: EventType, d: dict[str, object]) -> Payload:
+    """Parse an event's `payload` (§5) into the dataclass matching `event_type`.
+
+    Args:
+        event_type: the `type` field already parsed from the enclosing event envelope.
+        d: the raw `payload` object for that event.
+
+    Returns:
+        The typed `Payload` subclass for `event_type`.
+
+    Raises:
+        ValueError: if `event_type` has no known payload shape.
+    """
     if event_type is EventType.ROOM_CREATED:
         return RoomCreatedPayload(game=req_str(d, "game"), config=req_dict(d, "config"), seats_total=req_int(d, "seats_total"))
     if event_type is EventType.SEAT_JOINED:
@@ -280,6 +321,7 @@ def parse_payload(event_type: EventType, d: dict[str, object]) -> Payload:
 
 
 def parse_event(d: dict[str, object]) -> Event:
+    """Parse one event envelope (§5) — `seq`/`type`/`ts` plus its typed `payload`."""
     event_type = EventType(req_str(d, "type"))
     return Event(
         seq=req_int(d, "seq"),
@@ -293,10 +335,14 @@ def parse_event(d: dict[str, object]) -> Event:
 
 
 def parse_room_seat_slot(d: dict[str, object]) -> RoomSeatSlot:
+    """Parse one seat slot summary (§6) as shown before a room is joinable in full —
+    its `index`, occupancy `status`, and (once claimed) `kind`/`name`."""
     return RoomSeatSlot(index=req_int(d, "index"), status=req_str(d, "status"), kind=opt_str(d, "kind"), name=opt_str(d, "name"))
 
 
 def parse_room_created(d: dict[str, object]) -> RoomCreated:
+    """Parse the `POST /rooms` response: the new room's id, its host/invite
+    tokens, and the initial (empty) seat layout."""
     return RoomCreated(
         room_id=req_str(d, "room_id"),
         invite_token=req_str(d, "invite_token"),
@@ -306,6 +352,8 @@ def parse_room_created(d: dict[str, object]) -> RoomCreated:
 
 
 def parse_room_summary(d: dict[str, object]) -> RoomSummary:
+    """Parse a room's lobby-level summary (§6): game id, phase, seats, hand
+    number, and room status — no redacted table state included."""
     return RoomSummary(
         room_id=req_str(d, "room_id"),
         game=req_str(d, "game"),
@@ -317,6 +365,8 @@ def parse_room_summary(d: dict[str, object]) -> RoomSummary:
 
 
 def parse_hand_result(d: dict[str, object]) -> HandResult:
+    """Parse a completed hand's outcome (§6): pot awards, resulting stacks,
+    and (if reached) the showdown reveals."""
     return HandResult(
         hand_no=req_int(d, "hand_no"),
         pots=[parse_pot_award(as_dict(x)) for x in as_list(d.get("pots", []))],
