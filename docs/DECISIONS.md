@@ -929,3 +929,106 @@ uncollected-bets number just moved from one existing field to the other, no new 
 field. `pot_total` is provably unchanged at the instant a street closes and PokerKit sweeps `bets`
 into `pots` — same chips, relabeled — pinned by
 `test_pot_total_is_unchanged_when_a_street_closes_and_bets_sweep_into_pots`.
+---
+
+## 2026-08-26 — room-server: M2 WebSocket layer — one writer, one clock, flagged determinism fallout
+
+**Shared code path (invariant 6).** `Room.submit_action` (REST) and the new `Room.submit_action_for_seat`
+(WS `act`) both resolve their seat differently but then call the same `_commit_action`, extracted
+from the old `submit_action` body unchanged. This is also what makes "the same `request_id` over
+REST and then WS does not double-apply" free: idempotency is keyed by `(seat.index, request_id)` in
+`Room.idempotency`, which neither knows nor cares which transport wrote it.
+
+**Turn clock is now enforced over REST too, not just WS.** §8 says "now enforced" without gating by
+transport, so `Room._stamp` overwrites every adapter's placeholder `ActionRequiredPayload.deadline_ms`
+(always `0` from both `StubAdapter` and `HoldemAdapter` — an inert M1 placeholder) with a real,
+room-server-computed absolute epoch deadline, and a background `asyncio.Task` (`Room._run_timer`)
+enforces it regardless of whether any socket is even connected. A monotonic `timer_generation`
+counter is bumped on every arm/cancel; a timer that wakes up after being superseded checks it under
+`self.lock` and no-ops instead of double-applying — this, plus the lock itself, is the entire
+"a timeout wins any race" guarantee: there is no window where a late timer and a concurrent action
+can both commit.
+
+**Determinism-test fallout — flagged, not silently patched.** `deadline_ms` being real means
+`tests/unit/test_room_server.py::test_same_seed_same_actions_same_log_excluding_ts` needed the same
+treatment already given to `ts` (strip it before comparing) — that test is this package's own
+scratchpad, so it was updated directly. **`tests/contract/test_api_contract.py::
+test_same_seed_same_actions_produce_identical_log_excluding_ts` needs the identical one-line fix
+(strip `action_required.deadline_ms` alongside `ts`) and was deliberately left failing rather than
+edited**, per AGENTS.md ("do not modify anything under tests/contract/... if a contract test looks
+wrong, stop and say so") and this task's own instruction to flag rather than silently change REST-
+adjacent behavior. This is not a REST *response shape* regression — the field and its type are
+unchanged — only a previously-static placeholder becoming genuinely wall-clock-derived, exactly
+parallel to `ts`'s existing exemption. Flagged for the PROTOCOL.md/tests/contract owner.
+
+**Showdown-timeout forced action is duck-typed, not a hard `GameAdapter` member.** §3.2 wants "muck
+only if the seat cannot win any pot, otherwise show," which needs PokerKit's `state.can_win_now`
+— a primitive that lives only inside `packages/game_holdem`, out of reach behind invariant 2's opaque
+`S` TypeVar. Adding it as a *required* `GameAdapter` protocol member (in this package's own
+`adapter.py`, following the `setup_events`/`waiting_view` precedent) would still require
+`packages/game_holdem`'s `HoldemAdapter` to implement it for `mypy --strict packages/` to pass —
+out of scope for this task (ownership map: game_holdem is agent B's). `Room._forced_showdown_action`
+instead does `getattr(self.adapter, "can_win_now", None)`: if present and callable, uses it; if
+absent (as for every adapter today), defaults to `show`. That default still satisfies the hard
+invariant ("never muck a winning hand on a timeout") since always showing can never incorrectly
+forfeit a winner — it just doesn't get the muck-optimization until `game_holdem`'s owner adds the
+hook. Flagged for that owner and the PROTOCOL.md owner to promote to a real (optional) protocol
+member if/when a game needs the full rule.
+
+**Broadcast never holds the lock across socket I/O.** Each WS connection owns one `asyncio.Queue`
+registered via `Room.subscribe()`; `Room._broadcast` does a synchronous `put_nowait` per subscriber
+while `self.lock` is held (never awaits), and a per-connection pump task drains its queue onto the
+actual socket. A slow or dead client can therefore never stall a room mutation or another client's
+delivery; ordering per subscriber is preserved because enqueue happens in event order under the lock.
+
+**`hello` always replays from seq 0; `resume` is the real incremental reconnect path.** The ticket
+carries no "since," so a fresh connect can't know what a client has already seen — `hello.replay` is
+unconditionally the full log, and §8's explicit "clients must tolerate duplicates and dedupe on seq"
+is exactly what covers the overlap with a subsequent `resume {since}`, which does the actual atomic
+"replay since+1..latest_seq, then state as of exactly that seq" under one lock acquisition.
+
+---
+
+## 2026-08-26 — protocol: `can_win_now` promoted to a required `GameAdapter` member; two M2 fixes
+
+**`GameAdapter.can_win_now(s, seat) -> bool` is now §9, not a duck-typed room-server hook.** The
+previous entry's `getattr(self.adapter, "can_win_now", None)` fallback defaulted to always `show`
+when absent — safe against "never muck a winner," but *unsafe* the other direction: it never mucked
+a genuinely losing hand either, which is the entire point of the rule. A disconnected seat holding a
+beaten hand would have had its cards forced face-up into `showdown`'s `reveals[]` and the public
+event log, permanently, the first time any adapter besides `HoldemAdapter` (which never implemented
+the hook) was ever put behind a room needing showdown-timeout enforcement. Required, not optional,
+closes that hole for good — `packages/game_holdem/adapter.py`'s `HoldemAdapter.can_win_now` delegates
+straight to `state.pk.can_win_now(seat)`; `StubAdapter.can_win_now` returns membership in `s.active`
+(the stub has no showdown phase, so this is never actually consulted, but the protocol contract
+still needs an implementation). `Room._forced_showdown_action` (`packages/room_server/store.py`) now
+just calls `self.adapter.can_win_now(self.state, seat)` directly — no `getattr`, no default.
+
+**PokerKit's `can_win_now` compares against already-*exposed* hands only, never every hidden hand.**
+This is exactly right for the forced-timeout rule — it matches what a dealer could determine at that
+moment, since only exposed information is fair to act on — but must never be read as "this seat is
+the winner." A seat can pass `can_win_now` (nothing revealed yet beats it) and still lose once a
+later seat's hand comes up; the rule only ever asks "is this seat *already* provably beaten," not
+"is this seat destined to win." See §9/§10 and `test_showdown_timeout_forces_muck_for_a_seat_that_cannot_win`.
+
+**Invariant 3 now excludes `deadline_ms` alongside `ts`.** The M2 turn clock made
+`action_required.deadline_ms` a real, room-server-stamped wall-clock value (previously every
+adapter's inert `0` placeholder) — exactly the same category of non-determinism `ts` was already
+carved out for, and for the identical reason: stamped outside the adapter, from wall-clock time, and
+it doesn't affect game outcome. `docs/PROTOCOL.md` §0 invariant 3 and the §10 checklist were updated
+first, per AGENTS.md ("if the document is wrong, change it here first, then fix the code") — only
+then was `tests/contract/test_api_contract.py::
+test_same_seed_same_actions_produce_identical_log_excluding_ts_and_deadline_ms` (renamed from
+`..._excluding_ts`) updated to strip `deadline_ms` alongside `ts` and match the new invariant text.
+
+**`test_pots_are_materialized_once_per_view_not_read_twice` was asserting the wrong invariant, not
+catching a real bug.** Diagnosed by direct inspection of `HoldemAdapter.view()`: `pots =
+tuple(pk.pots)` is materialized exactly once per call, and `pot_total = sum(settled pot amounts) +
+sum(pk.bets)` is the documented, deliberate design (see the "live bets belong in pot_total" entry
+above) — `pk.pots` is genuinely `()` for an entire street until it closes, so `pot_total ==
+sum(pots[].amount)` is false by design the instant blinds are posted, which is exactly the state the
+test checked. No double-iterator-read exists in the adapter. Fixed the test to check what it actually
+meant to guard: `pots[]`/`pot_total` must not drift across repeated `view()` calls with nothing else
+happening (the real double-read symptom — a live iterator silently draining on a second read), plus
+the documented formula (`pot_total == sum(pots) + sum(committed_street across seats)`) explicitly,
+instead of the unconditional-equality assumption that was never true to begin with.

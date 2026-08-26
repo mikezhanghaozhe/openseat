@@ -6,6 +6,8 @@ every test here uses `game="holdem-nl"` and fails today at room creation.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -258,9 +260,13 @@ async def test_post_rooms_rejects_seats_out_of_range(client: httpx.AsyncClient) 
 # -- §10: determinism (invariant 3) ----------------------------------------------
 
 
-async def test_same_seed_same_actions_produce_identical_log_excluding_ts() -> None:
-    """§10: "Two runs with the same seed produce identical logs once ts is
-    stripped." Invariant 3."""
+async def test_same_seed_same_actions_produce_identical_log_excluding_ts_and_deadline_ms() -> None:
+    """§10 / invariant 3: "Two runs with the same seed produce identical
+    logs once ts and action_required.deadline_ms are stripped." Both fields
+    are stamped from wall-clock time by the room server, outside the
+    adapter, and neither affects game outcome — `deadline_ms` joined `ts` in
+    invariant 3's exclusion once the M2 turn clock started computing it from
+    real time instead of carrying the adapters' inert `0` placeholder."""
     from packages.room_server.main import create_app
 
     async def run() -> list[dict[str, object]]:
@@ -281,6 +287,8 @@ async def test_same_seed_same_actions_produce_identical_log_excluding_ts() -> No
             log = (await events(c, body["room_id"], since=-1)).json()["events"]
             for e in log:
                 del e["ts"]
+                if e["type"] == "action_required":
+                    del e["payload"]["deadline_ms"]
             return list(log)
 
     first = await run()
@@ -345,3 +353,69 @@ async def test_canonical_setup_and_action_event_order_matches_protocol(client: h
         EventType.POT_AWARDED.value,
         EventType.HAND_COMPLETE.value,
     ], "uncontested-fold suffix must be exactly action_taken -> pot_awarded -> hand_complete, no showdown"
+
+
+# -- §3.2/§8: showdown-phase turn-clock timeout ------------------------------
+
+
+async def test_showdown_timeout_forces_muck_for_a_seat_that_cannot_win(client: httpx.AsyncClient) -> None:
+    """§3.2/§8: "muck only if the seat cannot win any pot, otherwise show —
+    never muck a winning hand on a timeout." This is `GameAdapter.can_win_now`
+    (§9)'s entire reason for existing, and the flip side is just as real: a
+    seat that CANNOT win must not have its cards silently published to the
+    table and the event log just because it disconnected.
+
+    Seed 4 (offline-verified against `HoldemAdapter` directly, see
+    docs/DECISIONS.md) drives a real heads-up hand, checked down with no
+    raises on every street, to a two-decision discretionary showdown: seat 0
+    decides first and can win — shown here voluntarily, to expose its hand
+    and make seat 1's situation determinate; seat 1 decides second and,
+    once seat 0's hand is exposed, cannot win. Seat 1 is left to time out."""
+    config = {"sb": 25, "bb": 50, "ante": 0, "starting_stack": 5000, "turn_seconds": 1}
+    ctx = await setup_room(client, n_seats=2, config=config, seed=4)
+    room_id, seat_tokens = ctx["room_id"], ctx["seat_tokens"]
+
+    # check down every street — no raises, so nobody goes all-in and the
+    # hand reaches a genuine discretionary (not all-in) showdown
+    for _ in range(20):
+        peek = (await view(client, room_id, seat_tokens[0])).json()
+        seat = peek["to_act"]
+        if peek["phase"] == "showdown" or seat is None:
+            break
+        # legal_actions is seat-relative — must view as the actual actor,
+        # not always seat 0, or a seat 1 turn reads seat 0's (empty) options
+        obs = (await view(client, room_id, seat_tokens[seat])).json()
+        legal_types = {a["type"] for a in obs["legal_actions"]}
+        action = {"type": "check"} if "check" in legal_types else {"type": "call"}
+        resp = await submit_action(client, room_id, seat_tokens[seat], action)
+        assert resp.status_code == 200, resp.text
+
+    obs = (await view(client, room_id, seat_tokens[0])).json()
+    assert obs["phase"] == "showdown", "expected a discretionary showdown to be reached"
+    first_seat = obs["to_act"]
+    assert first_seat == 0, "seed 4 was verified offline to give seat 0 the first showdown decision"
+
+    show = await submit_action(client, room_id, seat_tokens[first_seat], {"type": "show"})
+    assert show.status_code == 200, show.text
+
+    obs = (await view(client, room_id, seat_tokens[1])).json()
+    assert obs["phase"] == "showdown"
+    assert obs["to_act"] == 1, "seat 1 must hold the second showdown decision"
+
+    # deliberately never act for seat 1 — let its turn clock fire
+    timed_out = None
+    for _ in range(50):
+        log = (await events(client, room_id, since=-1)).json()["events"]
+        timed_out = next((e for e in log if e["type"] == "seat_timed_out"), None)
+        if timed_out is not None:
+            break
+        await asyncio.sleep(0.1)
+
+    assert timed_out is not None, "turn clock never fired a forced action for seat 1"
+    assert timed_out["payload"]["seat"] == 1
+    assert "forced_action" not in timed_out["payload"], "§5.1: showdown-phase timeouts must omit forced_action"
+
+    outcome = (await result(client, room_id)).json()
+    revealed_seats = {r["seat"] for r in outcome["showdown"]}
+    assert 0 in revealed_seats, "seat 0 voluntarily showed"
+    assert 1 not in revealed_seats, "seat 1's forced action must have been muck, not show"

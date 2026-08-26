@@ -27,6 +27,11 @@ def new_seat_token() -> str:
     return f"sea_{secrets.token_urlsafe(32)}"
 
 
+def new_ws_ticket() -> str:
+    """Generate the `tkt_`-prefixed single-use WebSocket connection ticket (§1)."""
+    return f"tkt_{secrets.token_urlsafe(32)}"
+
+
 def tokens_equal(a: str | None, b: str | None) -> bool:
     """Constant-time comparison of two bearer tokens.
 

@@ -1,4 +1,5 @@
-"""FastAPI app for the M1 REST surface (docs/PROTOCOL.md §6).
+"""FastAPI app for the M1 REST surface (docs/PROTOCOL.md §6) plus the M2
+WebSocket push layer registered by `ws.py` (§1, §8).
 
 `create_app` takes an adapter registry so a real game package can be wired
 in without this module importing it — see AGENTS.md invariant 7 and the
@@ -16,7 +17,6 @@ from typing import Any
 from fastapi import FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse
 
-from packages.engine.types import Action, ActionType, ErrorCode
 from packages.room_server import config as server_config
 from packages.room_server.adapter import GameAdapter
 from packages.room_server.errors import ApiError
@@ -29,36 +29,8 @@ from packages.room_server.schemas import (
 from packages.room_server.serialize import to_wire, to_wire_dict
 from packages.room_server.store import PROTOCOL_VERSION, RoomStore
 from packages.room_server.stub import StubAdapter
-
-_BEARER_PREFIX = "Bearer "
-
-
-def _bearer_token(authorization: str | None) -> str | None:
-    """Extract the bearer token from an `Authorization` header value.
-
-    Args:
-        authorization: raw `Authorization` header, or None if absent.
-
-    Returns:
-        The token, or None if the header is missing, malformed, or empty after the prefix.
-    """
-    if authorization is None or not authorization.startswith(_BEARER_PREFIX):
-        return None
-    token = authorization[len(_BEARER_PREFIX) :].strip()
-    return token or None
-
-
-def _parse_action(action_in: ActionRequest) -> Action:
-    """Convert the wire `ActionRequest.action` into an engine `Action`.
-
-    Raises:
-        ApiError: `BAD_REQUEST` if `action_in.action.type` isn't a known `ActionType`.
-    """
-    try:
-        action_type = ActionType(action_in.action.type)
-    except ValueError as exc:
-        raise ApiError(ErrorCode.BAD_REQUEST, f"unknown action type {action_in.action.type!r}") from exc
-    return Action(type=action_type, to=action_in.action.to)
+from packages.room_server.wire import bearer_token, parse_action
+from packages.room_server.ws import register_ws_route
 
 
 def _default_adapters() -> dict[str, GameAdapter[Any]]:
@@ -159,7 +131,7 @@ def create_app(
         """`GET /v1/rooms/{room_id}/view` — the caller's redacted `Observation`
         for the seat identified by the bearer `seat_token`."""
         room = store.get(room_id)
-        seat_token = _bearer_token(authorization)
+        seat_token = bearer_token(authorization)
         obs = await room.view(seat_token)
         return to_wire_dict(obs)
 
@@ -168,8 +140,18 @@ def create_app(
         """`POST /v1/rooms/{room_id}/actions` — submit an action for the seat
         owning `body.seat_token`; `body.request_id` makes retries idempotent."""
         room = store.get(room_id)
-        action = _parse_action(body)
+        action = parse_action(body.action.type, body.action.to)
         result = await room.submit_action(body.seat_token, body.request_id, action, body.table_talk)
+        return {"protocol_version": PROTOCOL_VERSION, **result}
+
+    @app.post("/v1/rooms/{room_id}/ws-ticket")
+    async def ws_ticket(room_id: str, authorization: str | None = Header(default=None)) -> dict[str, object]:
+        """`POST /v1/rooms/{room_id}/ws-ticket` (§1) — mint a single-use, 30s
+        WS connection ticket for the seat or, given the room's
+        `invite_token` instead, a spectator."""
+        room = store.get(room_id)
+        token = bearer_token(authorization)
+        result = await room.issue_ws_ticket(token)
         return {"protocol_version": PROTOCOL_VERSION, **result}
 
     @app.get("/v1/rooms/{room_id}/events")
@@ -189,6 +171,8 @@ def create_app(
         room = store.get(room_id)
         result = await room.result()
         return {"protocol_version": PROTOCOL_VERSION, **result}
+
+    register_ws_route(app, store)
 
     return app
 

@@ -349,6 +349,12 @@ def test_claim_seat_bad_invite_token(client: TestClient) -> None:
 
 
 def test_same_seed_same_actions_same_log_excluding_ts() -> None:
+    """M2: `action_required.deadline_ms` is now a room-server-stamped
+    absolute wall-clock deadline (docs/PROTOCOL.md §8), not the adapters'
+    inert `0` placeholder from M1 — so, like `ts`, it necessarily differs
+    between two real-time runs of the same seed and must be stripped
+    alongside it for this comparison. See docs/DECISIONS.md."""
+
     def run() -> list[dict[str, object]]:
         app = create_app(allow_fixed_seed=True)
         with TestClient(app) as c:
@@ -360,6 +366,8 @@ def test_same_seed_same_actions_same_log_excluding_ts() -> None:
             events = c.get(f"/v1/rooms/{ctx['room_id']}/events?since=-1").json()["events"]
             for e in events:
                 del e["ts"]
+                if e["type"] == "action_required":
+                    del e["payload"]["deadline_ms"]
             return list(events)
 
     assert run() == run()

@@ -22,6 +22,8 @@ import jsonschema  # type: ignore[import-untyped]
 
 from packages.engine.types import (
     Action,
+    ActionRequiredPayload,
+    ActionType,
     ChatMessage,
     ErrorCode,
     Event,
@@ -38,6 +40,7 @@ from packages.engine.types import (
     RoomCreatedPayload,
     SeatJoinedPayload,
     SeatKind,
+    SeatTimedOutPayload,
     SeatView,
     ShowdownPayload,
     TableTalkPayload,
@@ -50,12 +53,20 @@ from packages.room_server.tokens import (
     new_invite_token,
     new_room_id,
     new_seat_token,
+    new_ws_ticket,
     tokens_equal,
 )
 
 _RANKS = "23456789TJQKA"
 _SUITS = "cdhs"
 PROTOCOL_VERSION = "0.1"
+
+# §1: ws-tickets are single-use and expire in 30s.
+_WS_TICKET_TTL_SECONDS = 30
+# Default turn clock length (§8) when a room's config omits `turn_seconds` —
+# both adapters' config_schema treat it as optional. Generous on purpose:
+# this is the M2 enforcement default, not a gameplay tuning knob.
+_DEFAULT_TURN_SECONDS = 30
 
 
 def _now_ms() -> int:
@@ -89,6 +100,16 @@ class SeatSlot:
 class IdempotencyRecord:
     action: Action
     response: dict[str, object]
+
+
+@dataclass
+class WsTicket:
+    """A single-use §1 ws-ticket. `seat_index=None` marks a spectator
+    ticket (minted from `invite_token`) — it can open a socket but its
+    connection never receives a `state` frame (§8)."""
+
+    seat_index: int | None
+    expires_at_ms: int
 
 
 class Room(Generic[S]):
@@ -131,6 +152,22 @@ class Room(Generic[S]):
         self.idempotency: dict[tuple[int, str], IdempotencyRecord] = {}
         self.lock = asyncio.Lock()
 
+        # -- M2 WebSocket layer state (docs/PROTOCOL.md §1, §8) -------------
+        self.ws_tickets: dict[str, WsTicket] = {}
+        # Fan-out: each live WS connection owns one queue; `_broadcast`
+        # enqueues (never awaits network I/O) while `self.lock` is held, so
+        # a slow/dead socket can never stall a room mutation. Order is
+        # preserved per-subscriber because enqueue happens in event order.
+        self._subscribers: set[asyncio.Queue[dict[str, object]]] = set()
+        # Turn clock (§8, §3.2): one outstanding timer per room. `timer_
+        # generation` is bumped by every arm/cancel so a timer that wakes up
+        # after being superseded (a real action beat it to the lock, or the
+        # room closed) recognizes it's stale and no-ops instead of double-
+        # applying a forced action — this is what makes "a timeout wins any
+        # race" safe to implement as a plain asyncio.sleep + lock re-acquire.
+        self.timer_task: asyncio.Task[None] | None = None
+        self.timer_generation = 0
+
     # -- internal helpers, only ever called while `self.lock` is held ------
 
     def _emit(self, event_type: EventType, payload: Payload) -> Event:
@@ -142,11 +179,32 @@ class Room(Generic[S]):
         self.events.append(ev)
         return ev
 
+    def _turn_clock_ms(self) -> int:
+        """`turn_seconds` from this room's config, in milliseconds, defaulting
+        when the config omits it (both adapters treat it as optional)."""
+        turn_seconds = self.config.get("turn_seconds", _DEFAULT_TURN_SECONDS)
+        assert isinstance(turn_seconds, int)
+        return turn_seconds * 1000
+
     def _stamp(self, unstamped: Event) -> Event:
         """Assign a real `seq`/`ts` to an adapter-produced placeholder event
-        (invariant 5: `seq` is monotonic per room, assigned only here), append it, and return it."""
+        (invariant 5: `seq` is monotonic per room, assigned only here), append it, and return it.
+
+        Every adapter emits `ActionRequiredPayload.deadline_ms` as an inert
+        `0` placeholder (M1: the clock wasn't enforced yet). This is the one
+        place that placeholder is replaced with the real, room-server-owned
+        absolute deadline (§8: "deadline_ms is absolute server epoch
+        milliseconds, not a duration") — adapters can't compute this
+        themselves; they don't know `turn_seconds` is now enforced, and
+        invariant 2's opaque-state boundary keeps game-specific timing logic
+        out of their reach anyway. See docs/DECISIONS.md re: the
+        determinism-test fallout of this becoming wall-clock-real.
+        """
         self.seq += 1
-        ev = replace(unstamped, seq=self.seq, ts=_now_ms())
+        payload = unstamped.payload
+        if isinstance(payload, ActionRequiredPayload):
+            payload = replace(payload, deadline_ms=_now_ms() + self._turn_clock_ms())
+        ev = replace(unstamped, seq=self.seq, ts=_now_ms(), payload=payload)
         self.events.append(ev)
         return ev
 
@@ -208,6 +266,147 @@ class Room(Generic[S]):
             for s in self.seats
             if s.status == "claimed" and s.name is not None and s.kind is not None
         ]
+
+    def _observation_for_seat(self, seat_index: int) -> Observation:
+        """The redacted `Observation` for `seat_index` — `waiting_view`
+        before the hand has started, `view` afterward. The single
+        construction site behind both REST `GET /view` and the WS `state`
+        frame (§4: "identical shape in both"), entered either via a
+        `seat_token` lookup (`view`) or an already-ticket-authenticated
+        seat index (`view_by_index`, `resume`). Must be called with
+        `self.lock` already held."""
+        if self.state is None:
+            obs = self.adapter.waiting_view(self.config, self._claimed_seats(), seat_index)
+        else:
+            obs = self.adapter.view(self.state, seat_index)
+        return self._overlay(obs)
+
+    def _forced_showdown_action(self, seat: int) -> ActionType:
+        """The forced discretionary action for a showdown-phase turn-clock
+        timeout (§3.2): muck only if `seat` cannot win any pot, otherwise
+        show — a disconnect must never cost a seat a pot it had won, and
+        must never publish a beaten hand's cards either.
+
+        `GameAdapter.can_win_now` (§9) is the primitive this is built on —
+        see docs/DECISIONS.md for why it's a required protocol member now,
+        not a duck-typed optional hook."""
+        assert self.state is not None
+        return ActionType.SHOW if self.adapter.can_win_now(self.state, seat) else ActionType.MUCK
+
+    def subscribe(self) -> asyncio.Queue[dict[str, object]]:
+        """Register a new WS connection's fan-out queue for `event`/`clock`
+        broadcasts (§8). Pair with `unsubscribe` when the connection closes."""
+        queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        self._subscribers.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[dict[str, object]]) -> None:
+        """Drop a WS connection's fan-out queue, e.g. on disconnect."""
+        self._subscribers.discard(queue)
+
+    def _broadcast(self, frame: dict[str, object]) -> None:
+        """Enqueue one wire frame onto every live subscriber. Synchronous
+        and non-blocking (`put_nowait` on an unbounded queue) so this can be
+        called freely from inside `self.lock` without holding it across any
+        socket I/O — each connection's own pump task drains its queue."""
+        for queue in self._subscribers:
+            queue.put_nowait(frame)
+
+    def _cancel_timer(self) -> None:
+        """Cancel any outstanding turn-clock timer and invalidate it via
+        `timer_generation`, so a timer already mid-`asyncio.sleep` that
+        wakes up after this no-ops instead of forcing a stale action."""
+        self.timer_generation += 1
+        if self.timer_task is not None and not self.timer_task.done():
+            self.timer_task.cancel()
+        self.timer_task = None
+
+    def _arm_timer(self, action_required: Event) -> None:
+        """Start the turn clock for the seat named in `action_required`
+        (§8: "The server starts a timer on action_required"), broadcasting
+        the `clock` frame and scheduling the enforcement task. Must be
+        called with `self.lock` already held."""
+        assert isinstance(action_required.payload, ActionRequiredPayload)
+        self._cancel_timer()
+        self.timer_generation += 1
+        generation = self.timer_generation
+        seat = action_required.payload.seat
+        deadline_ms = action_required.payload.deadline_ms
+        self._broadcast({"t": "clock", "seat": seat, "deadline_ms": deadline_ms})
+        self.timer_task = asyncio.create_task(self._run_timer(generation, seat, deadline_ms))
+
+    async def _run_timer(self, generation: int, seat: int, deadline_ms: int) -> None:
+        """Sleep until `deadline_ms`, then — unless superseded — force
+        `seat`'s action and emit `seat_timed_out` (§8, §3.2, §5.1).
+
+        "A timeout wins any race" (§8): once woken, this re-acquires
+        `self.lock` like any other mutation and checks `generation` against
+        `self.timer_generation`; if a real action (or a newer timer) beat it
+        to the lock, `generation` is stale and this is a no-op. There is no
+        window where a late timer and a concurrent action can both commit —
+        the lock and the generation check together rule it out.
+        """
+        delay = max(0.0, (deadline_ms - _now_ms()) / 1000)
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        async with self.lock:
+            if generation != self.timer_generation or self.closed or self.state is None:
+                return
+            obs = self.adapter.view(self.state, seat)
+            if obs.to_act != seat:
+                return
+
+            forced_action_for_event: ActionType | None
+            if obs.phase == Phase.SHOWDOWN:
+                forced_type = self._forced_showdown_action(seat)
+                # §5.1: withheld — broadcasting it would prove the hand was
+                # beaten (or not) before any card is revealed.
+                forced_action_for_event = None
+            else:
+                legal_types = {spec.type for spec in obs.legal_actions}
+                forced_type = ActionType.CHECK if ActionType.CHECK in legal_types else ActionType.FOLD
+                forced_action_for_event = forced_type
+
+            try:
+                adapter_events = self.adapter.apply(self.state, seat, Action(type=forced_type))
+            except IllegalAction:
+                # Defensive only: forced_type is derived from this same
+                # seat's own current legal_actions/phase, so this should be
+                # unreachable — but a forced action must never crash the
+                # timer task silently corrupting nothing instead.
+                return
+
+            stamped = [self._stamp(ev) for ev in adapter_events]
+            stamped.append(
+                self._stamp(
+                    Event(
+                        seq=0,
+                        type=EventType.SEAT_TIMED_OUT,
+                        ts=0,
+                        payload=SeatTimedOutPayload(seat=seat, forced_action=forced_action_for_event),
+                    )
+                )
+            )
+            self._after_events(stamped)
+
+    def _after_events(self, stamped: list[Event]) -> None:
+        """Run after any batch of events is stamped (`/start`, an applied
+        action, or a forced timeout): broadcast them to every WS subscriber,
+        then either close the room and cancel the clock (`hand_complete`) or
+        arm it for the new `action_required`. §5.0's suffix table always
+        ends in exactly one of the two, never both, never neither. Must be
+        called with `self.lock` already held."""
+        for ev in stamped:
+            self._broadcast({"t": "event", "payload": to_wire(ev)})
+        if any(ev.type == EventType.HAND_COMPLETE for ev in stamped):
+            self.closed = True
+            self._cancel_timer()
+            return
+        action_required = next((ev for ev in reversed(stamped) if ev.type == EventType.ACTION_REQUIRED), None)
+        if action_required is not None:
+            self._arm_timer(action_required)
 
     # -- public API, each acquires the room's lock --------------------------
 
@@ -280,8 +479,7 @@ class Room(Generic[S]):
             self.state = state
 
             stamped = [self._stamp(ev) for ev in self.adapter.setup_events(state)]
-            if any(ev.type == EventType.HAND_COMPLETE for ev in stamped):
-                self.closed = True
+            self._after_events(stamped)
             self.started = True
 
             hand_started = next(ev for ev in stamped if ev.type == EventType.HAND_STARTED)
@@ -297,6 +495,80 @@ class Room(Generic[S]):
             self.start_response = response
             return response
 
+    def _commit_action(
+        self,
+        seat: SeatSlot,
+        request_id: str,
+        action: Action,
+        table_talk: str | None,
+    ) -> dict[str, object]:
+        """Validate and apply one action for `seat` — the single code path
+        shared by REST `submit_action` and WS `submit_action_for_seat`
+        (the M2 task's "same validation, same idempotency, same seq
+        assignment" requirement: this *is* how the two transports share it).
+        Must be called with `self.lock` already held.
+
+        Raises:
+            ApiError: `REQUEST_ID_CONFLICT`, `ROOM_CLOSED`, `NOT_YOUR_TURN`, or `ILLEGAL_ACTION`.
+        """
+        # Idempotency is checked before the closed/turn gates: a client
+        # retrying the very request that closed the room (its response
+        # was dropped in flight) must still get its original result, not
+        # 410. Only requests that were never applied are subject to the
+        # gates below. Reservation itself happens only on commit, further
+        # down — this is strictly a replay lookup.
+        key = (seat.index, request_id)
+        existing = self.idempotency.get(key)
+        if existing is not None:
+            if existing.action == action:
+                return {**existing.response, "replayed": True}
+            raise ApiError(ErrorCode.REQUEST_ID_CONFLICT, "request_id already used with a different action")
+
+        if self.closed:
+            raise ApiError(ErrorCode.ROOM_CLOSED, "room is closed")
+        if self.state is None:
+            raise ApiError(ErrorCode.NOT_YOUR_TURN, "hand has not started")
+
+        obs = self.adapter.view(self.state, seat.index)
+        if obs.to_act != seat.index:
+            raise ApiError(
+                ErrorCode.NOT_YOUR_TURN,
+                "not this seat's turn",
+                legal_actions=[to_wire(a) for a in obs.legal_actions],
+            )
+
+        try:
+            adapter_events = self.adapter.apply(self.state, seat.index, action)
+        except IllegalAction as exc:
+            raise ApiError(
+                ErrorCode.ILLEGAL_ACTION,
+                exc.reason,
+                legal_actions=[to_wire(a) for a in exc.legal_actions],
+            ) from exc
+
+        to_stamp: list[Event] = []
+        if table_talk:
+            to_stamp.append(
+                Event(
+                    seq=0,
+                    type=EventType.TABLE_TALK,
+                    ts=0,
+                    payload=TableTalkPayload(seat=seat.index, name=seat.name or "", text=table_talk),
+                )
+            )
+        to_stamp.extend(adapter_events)
+        stamped = [self._stamp(ev) for ev in to_stamp]
+
+        self._after_events(stamped)
+
+        response: dict[str, object] = {
+            "first_seq": stamped[0].seq,
+            "last_seq": stamped[-1].seq,
+            "accepted": True,
+        }
+        self.idempotency[key] = IdempotencyRecord(action=action, response=response)
+        return response
+
     async def submit_action(
         self,
         seat_token: str | None,
@@ -304,81 +576,34 @@ class Room(Generic[S]):
         action: Action,
         table_talk: str | None,
     ) -> dict[str, object]:
-        """Validate and apply one action for the seat owning `seat_token`.
-
-        Args:
-            seat_token: bearer token identifying the acting seat.
-            request_id: idempotency key — a retry with the same id and the
-                same action returns the original response (`replayed: True`)
-                instead of re-applying it; the same id with a *different*
-                action is a client bug and raises `REQUEST_ID_CONFLICT`.
-            action: the submitted action; validated against `legal_actions` before being applied.
-            table_talk: optional chat text to emit alongside the action.
+        """`POST /actions` entry point: resolve `seat_token` to a seat, then
+        commit through `_commit_action`.
 
         Raises:
-            ApiError: `REQUEST_ID_CONFLICT`, `ROOM_CLOSED`, `NOT_YOUR_TURN`, or `ILLEGAL_ACTION`.
+            ApiError: `INVALID_TOKEN` (bad `seat_token`), or anything `_commit_action` raises.
         """
         async with self.lock:
             seat = self._seat_by_token(seat_token)
+            return self._commit_action(seat, request_id, action, table_talk)
 
-            # Idempotency is checked before the closed/turn gates: a client
-            # retrying the very request that closed the room (its response
-            # was dropped in flight) must still get its original result, not
-            # 410. Only requests that were never applied are subject to the
-            # gates below. Reservation itself happens only on commit, further
-            # down — this is strictly a replay lookup.
-            key = (seat.index, request_id)
-            existing = self.idempotency.get(key)
-            if existing is not None:
-                if existing.action == action:
-                    return {**existing.response, "replayed": True}
-                raise ApiError(ErrorCode.REQUEST_ID_CONFLICT, "request_id already used with a different action")
-
-            if self.closed:
-                raise ApiError(ErrorCode.ROOM_CLOSED, "room is closed")
-            if self.state is None:
-                raise ApiError(ErrorCode.NOT_YOUR_TURN, "hand has not started")
-
-            obs = self.adapter.view(self.state, seat.index)
-            if obs.to_act != seat.index:
-                raise ApiError(
-                    ErrorCode.NOT_YOUR_TURN,
-                    "not this seat's turn",
-                    legal_actions=[to_wire(a) for a in obs.legal_actions],
-                )
-
-            try:
-                adapter_events = self.adapter.apply(self.state, seat.index, action)
-            except IllegalAction as exc:
-                raise ApiError(
-                    ErrorCode.ILLEGAL_ACTION,
-                    exc.reason,
-                    legal_actions=[to_wire(a) for a in exc.legal_actions],
-                ) from exc
-
-            to_stamp: list[Event] = []
-            if table_talk:
-                to_stamp.append(
-                    Event(
-                        seq=0,
-                        type=EventType.TABLE_TALK,
-                        ts=0,
-                        payload=TableTalkPayload(seat=seat.index, name=seat.name or "", text=table_talk),
-                    )
-                )
-            to_stamp.extend(adapter_events)
-            stamped = [self._stamp(ev) for ev in to_stamp]
-
-            if any(ev.type == EventType.HAND_COMPLETE for ev in stamped):
-                self.closed = True
-
-            response: dict[str, object] = {
-                "first_seq": stamped[0].seq,
-                "last_seq": stamped[-1].seq,
-                "accepted": True,
-            }
-            self.idempotency[key] = IdempotencyRecord(action=action, response=response)
-            return response
+    async def submit_action_for_seat(
+        self,
+        seat_index: int,
+        request_id: str,
+        action: Action,
+        table_talk: str | None,
+    ) -> dict[str, object]:
+        """WS `act` entry point: `seat_index` was already authenticated by
+        the ws-ticket consumed at connect time (§1), so — unlike
+        `submit_action` — there is no token to re-check here; it commits
+        through the identical `_commit_action` REST uses, sharing
+        idempotency (§ "the same request_id over REST and then WS does not
+        double-apply" — the `(seat.index, request_id)` key doesn't care
+        which transport it came through).
+        """
+        async with self.lock:
+            seat = self.seats[seat_index]
+            return self._commit_action(seat, request_id, action, table_talk)
 
     async def view(self, seat_token: str | None) -> Observation:
         """The redacted `Observation` for the seat owning `seat_token` —
@@ -389,11 +614,73 @@ class Room(Generic[S]):
         """
         async with self.lock:
             seat = self._seat_by_token(seat_token)
-            if self.state is None:
-                obs = self.adapter.waiting_view(self.config, self._claimed_seats(), seat.index)
-                return self._overlay(obs)
-            obs = self.adapter.view(self.state, seat.index)
-            return self._overlay(obs)
+            return self._observation_for_seat(seat.index)
+
+    async def view_by_index(self, seat_index: int) -> Observation:
+        """The `state`-frame counterpart of `view()`, for a WS connection
+        already authenticated to `seat_index` via a consumed ws-ticket."""
+        async with self.lock:
+            return self._observation_for_seat(seat_index)
+
+    async def resume(self, seat_index: int | None, since: int) -> tuple[list[Event], int, Observation | None]:
+        """WS `resume` (§8): capture `latest_seq` once, gather every event
+        after `since`, and — for a seat connection, never a spectator —
+        build the `Observation` as of that exact snapshot, all inside one
+        lock acquisition so no action can commit in between ("a client must
+        never receive a view that predates events it just replayed").
+
+        Returns:
+            `(replay_events, latest_seq, observation_or_none)` — observation
+            is `None` for a spectator (`seat_index is None`), since
+            spectators never receive a `state` frame (§8).
+        """
+        async with self.lock:
+            latest = self.seq
+            replay = [ev for ev in self.events if ev.seq > since]
+            obs = self._observation_for_seat(seat_index) if seat_index is not None else None
+            return replay, latest, obs
+
+    async def issue_ws_ticket(self, token: str | None) -> dict[str, object]:
+        """`POST /rooms/{id}/ws-ticket` (§1): mint a single-use, 30s ticket
+        mapping to the seat owning `token` — or, if `token` is this room's
+        `invite_token` instead, a spectator ticket (`seat_index=None`),
+        whose connection only ever gets `event`/`clock` frames, never `state`.
+
+        Raises:
+            ApiError: `INVALID_TOKEN` if `token` is neither a claimed seat's
+                `seat_token` nor this room's `invite_token`.
+        """
+        async with self.lock:
+            matched = next(
+                (s for s in self.seats if s.status == "claimed" and tokens_equal(token, s.seat_token)), None
+            )
+            seat_index: int | None
+            if matched is not None:
+                seat_index = matched.index
+            elif tokens_equal(token, self.invite_token):
+                seat_index = None
+            else:
+                raise ApiError(ErrorCode.INVALID_TOKEN, "token is not a seat_token or invite_token for this room")
+            ticket = new_ws_ticket()
+            self.ws_tickets[ticket] = WsTicket(
+                seat_index=seat_index, expires_at_ms=_now_ms() + _WS_TICKET_TTL_SECONDS * 1000
+            )
+            return {"ticket": ticket, "expires_in": _WS_TICKET_TTL_SECONDS}
+
+    async def consume_ws_ticket(self, ticket: str) -> int | None:
+        """Redeem a ws-ticket at WS connect time: single-use — popped
+        unconditionally, so a repeat or racing use of the same ticket always
+        fails — and rejected if unknown or past its 30s expiry.
+
+        Raises:
+            ApiError: `INVALID_TOKEN` if `ticket` was never issued, was
+                already used, or has expired.
+        """
+        async with self.lock:
+            record = self.ws_tickets.pop(ticket, None)
+            if record is None or record.expires_at_ms < _now_ms():
+                raise ApiError(ErrorCode.INVALID_TOKEN, "ws ticket unknown, already used, or expired")
+            return record.seat_index
 
     async def events_since(self, since: int) -> tuple[list[Event], int]:
         """Events with `seq` strictly greater than `since`, plus the room's
