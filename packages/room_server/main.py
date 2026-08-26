@@ -34,6 +34,14 @@ _BEARER_PREFIX = "Bearer "
 
 
 def _bearer_token(authorization: str | None) -> str | None:
+    """Extract the bearer token from an `Authorization` header value.
+
+    Args:
+        authorization: raw `Authorization` header, or None if absent.
+
+    Returns:
+        The token, or None if the header is missing, malformed, or empty after the prefix.
+    """
     if authorization is None or not authorization.startswith(_BEARER_PREFIX):
         return None
     token = authorization[len(_BEARER_PREFIX) :].strip()
@@ -41,6 +49,11 @@ def _bearer_token(authorization: str | None) -> str | None:
 
 
 def _parse_action(action_in: ActionRequest) -> Action:
+    """Convert the wire `ActionRequest.action` into an engine `Action`.
+
+    Raises:
+        ApiError: `BAD_REQUEST` if `action_in.action.type` isn't a known `ActionType`.
+    """
     try:
         action_type = ActionType(action_in.action.type)
     except ValueError as exc:
@@ -81,6 +94,14 @@ def create_app(
     adapters: dict[str, GameAdapter[Any]] | None = None,
     allow_fixed_seed: bool | None = None,
 ) -> FastAPI:
+    """Build the FastAPI app: wire a `RoomStore` over `adapters` (or the
+    default registry) and register every §6 route against it.
+
+    Args:
+        adapters: game-id -> `GameAdapter` registry; defaults to `_default_adapters()`.
+        allow_fixed_seed: overrides `server_config.allow_fixed_seed()` when not None
+            (used by tests to force fixed-seed rooms on/off deterministically).
+    """
     registry: dict[str, GameAdapter[Any]] = adapters if adapters is not None else _default_adapters()
     store: RoomStore[Any] = RoomStore(
         adapters=registry,
@@ -91,6 +112,7 @@ def create_app(
 
     @app.exception_handler(ApiError)
     async def _handle_api_error(_request: Request, exc: ApiError) -> JSONResponse:
+        """Convert any raised `ApiError` into its §7 JSON error response."""
         return JSONResponse(
             status_code=exc.status_code,
             content={"protocol_version": PROTOCOL_VERSION, **exc.body()},
@@ -98,6 +120,7 @@ def create_app(
 
     @app.post("/v1/rooms", status_code=201)
     async def create_room(body: CreateRoomRequest) -> dict[str, object]:
+        """`POST /v1/rooms` — create a new room and return its id plus host/invite tokens."""
         room = await store.create_room(body.game, body.seats, body.config, body.seed)
         return {
             "protocol_version": PROTOCOL_VERSION,
@@ -109,6 +132,7 @@ def create_app(
 
     @app.post("/v1/rooms/{room_id}/seats", status_code=201)
     async def claim_seat(room_id: str, body: ClaimSeatRequest) -> dict[str, object]:
+        """`POST /v1/rooms/{room_id}/seats` — claim an open seat, returning its bearer `seat_token`."""
         room = store.get(room_id)
         slot = await room.claim_seat(body.invite_token, body.seat, body.kind, body.display_name)
         return {
@@ -119,17 +143,21 @@ def create_app(
 
     @app.get("/v1/rooms/{room_id}")
     async def room_summary(room_id: str) -> dict[str, object]:
+        """`GET /v1/rooms/{room_id}` — the room's lobby-level summary; no auth required."""
         room = store.get(room_id)
         return {"protocol_version": PROTOCOL_VERSION, **(await room.summary())}
 
     @app.post("/v1/rooms/{room_id}/start")
     async def start_room(room_id: str, body: StartRequest) -> dict[str, object]:
+        """`POST /v1/rooms/{room_id}/start` — host-only: begin play once all seats are filled."""
         room = store.get(room_id)
         result = await room.start(body.host_token)
         return {"protocol_version": PROTOCOL_VERSION, **result}
 
     @app.get("/v1/rooms/{room_id}/view")
     async def view_room(room_id: str, authorization: str | None = Header(default=None)) -> dict[str, object]:
+        """`GET /v1/rooms/{room_id}/view` — the caller's redacted `Observation`
+        for the seat identified by the bearer `seat_token`."""
         room = store.get(room_id)
         seat_token = _bearer_token(authorization)
         obs = await room.view(seat_token)
@@ -137,6 +165,8 @@ def create_app(
 
     @app.post("/v1/rooms/{room_id}/actions")
     async def submit_action(room_id: str, body: ActionRequest) -> dict[str, object]:
+        """`POST /v1/rooms/{room_id}/actions` — submit an action for the seat
+        owning `body.seat_token`; `body.request_id` makes retries idempotent."""
         room = store.get(room_id)
         action = _parse_action(body)
         result = await room.submit_action(body.seat_token, body.request_id, action, body.table_talk)
@@ -144,6 +174,7 @@ def create_app(
 
     @app.get("/v1/rooms/{room_id}/events")
     async def room_events(room_id: str, since: int = Query(default=0)) -> dict[str, object]:
+        """`GET /v1/rooms/{room_id}/events` — events with `seq` > `since`, plus the room's `latest_seq`."""
         room = store.get(room_id)
         events, latest_seq = await room.events_since(since)
         return {
@@ -154,6 +185,7 @@ def create_app(
 
     @app.get("/v1/rooms/{room_id}/result")
     async def room_result(room_id: str) -> dict[str, object]:
+        """`GET /v1/rooms/{room_id}/result` — the outcome of the most recently completed hand."""
         room = store.get(room_id)
         result = await room.result()
         return {"protocol_version": PROTOCOL_VERSION, **result}

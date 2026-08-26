@@ -430,6 +430,12 @@ class IllegalAction(Exception):
     """Raised by `GameAdapter.apply` instead of silently correcting state."""
 
     def __init__(self, reason: str, legal_actions: list[ActionSpec]) -> None:
+        """
+        Args:
+            reason: short human-readable explanation of why the action was rejected.
+            legal_actions: the actions the acting seat could legally take instead,
+                so the caller (or an error response) can surface them.
+        """
         super().__init__(reason)
         self.reason = reason
         self.legal_actions = legal_actions

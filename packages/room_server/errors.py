@@ -28,7 +28,16 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
 
 
 class ApiError(Exception):
+    """A protocol-level API error, raised anywhere in the request path and
+    caught once at the FastAPI boundary to produce a JSON error response."""
+
     def __init__(self, code: ErrorCode, reason: str, **context: object) -> None:
+        """
+        Args:
+            code: protocol `ErrorCode`; looked up in `_STATUS_BY_CODE` for the HTTP status.
+            reason: short human-readable explanation, also passed to `Exception.__init__`.
+            **context: extra JSON-safe fields merged into the error body (e.g. `legal_actions`).
+        """
         super().__init__(reason)
         self.code = code
         self.status_code = _STATUS_BY_CODE[code]
@@ -36,4 +45,5 @@ class ApiError(Exception):
         self.context = context
 
     def body(self) -> dict[str, object]:
+        """Build the JSON-serializable error response body for this error."""
         return {"error": self.code.value, "reason": self.reason, **self.context}

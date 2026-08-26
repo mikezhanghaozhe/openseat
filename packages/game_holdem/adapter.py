@@ -72,25 +72,25 @@ class GameState:
     holds this only as an opaque `TypeVar` instance — see the CRITICAL
     BOUNDARY note in `packages/room_server/adapter.py`."""
 
-    pk: State
-    hand_no: int
-    button: int
-    seats_total: int
-    starting_stacks: list[int]
-    sb: int
-    bb: int
-    ante: int
-    remaining_deck: list[str]
-    full_deck: list[str]
-    seat_status: list[SeatStatus]
-    last_action: dict[int, Action] = field(default_factory=dict)
-    revealed: dict[int, Reveal] = field(default_factory=dict)
-    board_deals_done: int = 0
-    phase: Phase = Phase.PREFLOP
-    awaiting_showdown_seat: int | None = None
+    pk: State  # the wrapped pokerkit state; source of truth for cards, bets, stacks, and legality
+    hand_no: int  # 1-based index of the current hand within this room (increments each new hand)
+    button: int  # seat index holding the dealer button this hand; fixed at seats_total - 1 (see reset())
+    seats_total: int  # number of seats at the table, claimed or not
+    starting_stacks: list[int]  # each seat's stack at the start of THIS hand, in seat order (used by results())
+    sb: int  # small blind: the smaller of the two forced pre-deal bets.
+    bb: int  # big blind: the larger forced pre-deal bet; sb < bb always (see _check_cross_field_config).
+    ante: int  # per-seat forced bet posted before blinds, in addition to sb/bb; 0 if the room has no ante
+    remaining_deck: list[str]  # cards not yet dealt this hand, consumed in order by cards.draw()
+    full_deck: list[str]  # the complete shuffled deck this hand was dealt from, unmodified (echoed in HAND_COMPLETE)
+    seat_status: list[SeatStatus]  # each seat's ACTIVE/FOLDED/ALL_IN status this hand, in seat order
+    last_action: dict[int, Action] = field(default_factory=dict)  # seat -> most recent action it took this hand
+    revealed: dict[int, Reveal] = field(default_factory=dict)  # seat -> its shown hand, once revealed at showdown
+    board_deals_done: int = 0  # how many of flop/turn/river have been dealt so far (0-3)
+    phase: Phase = Phase.PREFLOP  # current betting round / hand stage, surfaced directly in Observation.phase
+    awaiting_showdown_seat: int | None = None  # seat with a pending discretionary show/muck decision, if any
     # seat -> hole cards, captured immediately at show time (see _build_reveal).
     pending_all_in_reveals: dict[int, list[str]] = field(default_factory=dict)
-    hand_had_showdown: bool = False
+    hand_had_showdown: bool = False  # whether this hand reached a real showdown (vs. an uncontested win)
     # Pre-drain snapshot, populated by _finalize before any push_chips()
     # call — see the `pots` property below.
     _final_pots: tuple[Pot, ...] | None = field(default=None, repr=False)
@@ -147,6 +147,8 @@ class GameState:
 
 
 def _int(value: object) -> int:
+    """Assert `value` is an `int` and return it typed as such — used to
+    narrow config values already schema-checked as JSON integers."""
     assert isinstance(value, int)
     return value
 
@@ -194,14 +196,20 @@ def _resolve_starting_stacks(cfg: dict[str, object], bb: int, seats: int) -> lis
 
 
 def _unstamped(event_type: EventType, payload: object) -> Event:
+    """Build an `Event` with placeholder `seq`/`ts`, to be stamped later by
+    the room server (which owns the room's monotonic `seq` counter)."""
     return Event(seq=0, type=event_type, ts=0, payload=payload)  # type: ignore[arg-type]
 
 
 def _pot_total(pk: State) -> int:
+    """Total chips currently in play: settled pot amounts plus each seat's
+    not-yet-collected bet for the current street."""
     return sum(p.amount for p in tuple(pk.pots)) + sum(pk.bets)
 
 
 def _board(pk: State) -> list[str]:
+    """Flatten pokerkit's `board_cards` (grouped by dealing round) into a
+    single flat list of card string reprs, in deal order."""
     return [repr(c) for group in pk.board_cards for c in group]
 
 
@@ -287,6 +295,18 @@ def _advance(s: GameState) -> list[Event]:
 
 
 def _finalize(s: GameState) -> list[Event]:
+    """Resolve a completed hand: emit any pending showdown reveal, drain
+    pokerkit's pots into per-seat awards (showdown or uncontested), and
+    emit the closing `POT_AWARDED`/`HAND_COMPLETE` events. Called by
+    `_advance` exactly once, when `pk.can_push_chips()` first becomes true.
+
+    Args:
+        s: the hand's mutable `GameState`, updated in place (phase set to
+            `HAND_COMPLETE`, `_final_pots` snapshotted).
+
+    Returns:
+        The events produced by finalizing (showdown, if any; pot awards; hand complete).
+    """
     pk = s.pk
     events: list[Event] = []
 
@@ -363,6 +383,8 @@ def _finalize(s: GameState) -> list[Event]:
 
 
 def _render_text(s: GameState, seat: int, board: list[str], to_call: int | None) -> str:
+    """Build the human-readable `Observation.text` summary shown to `seat`
+    (hole cards, board, pot size, and what's owed to call)."""
     hole = " ".join(repr(c) for c in s.pk.hole_cards[seat])
     board_text = " ".join(board) if board else "(none)"
     call_text = f"To call: {to_call}" if to_call else "Nothing to call"
@@ -376,6 +398,8 @@ class HoldemAdapter:
     """No-Limit Texas Hold'em, id `"holdem-nl"` (docs/PROTOCOL.md §6)."""
 
     def __init__(self) -> None:
+        """Set the adapter's protocol identity (`id`, seat bounds) and build
+        `config_schema` for the room server to validate room-creation configs against."""
         self.id = "holdem-nl"
         self.min_players = 2
         self.max_players = 9
@@ -388,8 +412,8 @@ class HoldemAdapter:
         self.config_schema: dict[str, object] = {
             "type": "object",
             "properties": {
-                "sb": {"type": "integer", "exclusiveMinimum": 0},
-                "bb": {"type": "integer", "exclusiveMinimum": 0},
+                "sb": {"type": "integer", "exclusiveMinimum": 0},  # small blind amount, in chips
+                "bb": {"type": "integer", "exclusiveMinimum": 0},  # big blind amount, in chips; must be > sb
                 "ante": {"type": "integer", "minimum": 0},
                 "starting_stack": {"type": "integer", "exclusiveMinimum": 0},
                 "starting_stacks": {"type": "array", "items": {"type": "integer"}},
@@ -405,13 +429,26 @@ class HoldemAdapter:
         `config_schema`) still gets `400 invalid_config` at creation time
         instead of crashing `/start` later. See docs/DECISIONS.md, "a bad
         config could crash /start instead of failing at POST /rooms"."""
-        sb = _int(cfg["sb"])
-        bb = _int(cfg["bb"])
+        sb = _int(cfg["sb"])  # small blind: mandatory bet posted by one seat before cards are dealt
+        bb = _int(cfg["bb"])  # big blind: mandatory bet posted by another seat; sets the minimum opening bet
         ante = _int(cfg.get("ante", 0))
         _check_cross_field_config(sb, bb, ante)
         _resolve_starting_stacks(cfg, bb, seats)
 
     def reset(self, cfg: dict[str, object], deck: list[str]) -> GameState:
+        """`GameAdapter.reset` (§9): start a new hand from a validated
+        config and a pre-shuffled deck.
+
+        Args:
+            cfg: room config (already schema-validated); must include `sb`,
+                `bb`, `_seats`, and exactly one of `starting_stack`/`starting_stacks`.
+            deck: the seeded-RNG-shuffled deck to deal from, consumed in order.
+
+        Returns:
+            The new hand's `GameState`, already advanced past any automatic
+            steps (blinds, hole cards) to the point where the first real
+            decision is needed.
+        """
         sb = _int(cfg["sb"])
         bb = _int(cfg["bb"])
         ante = _int(cfg.get("ante", 0))
@@ -473,9 +510,16 @@ class HoldemAdapter:
         if s.ante > 0:
             postings.extend(Posting(seat=i, amount=s.ante, kind=PostingKind.ANTE) for i in range(s.seats_total))
         if s.seats_total == 2:
+            # Heads-up rule: the button (seat 0 here, per pokerkit's own
+            # indexing — see the `button=` comment in reset()) posts the big
+            # blind and acts second post-flop; the other seat posts the
+            # small blind and acts first post-flop. This is the standard
+            # heads-up exception to the usual sb-then-bb seating order below.
             postings.append(Posting(seat=0, amount=s.bb, kind=PostingKind.BB))
             postings.append(Posting(seat=1, amount=s.sb, kind=PostingKind.SB))
         else:
+            # 3+ players: standard order, small blind then big blind,
+            # starting from the seat immediately left of the button.
             postings.append(Posting(seat=0, amount=s.sb, kind=PostingKind.SB))
             postings.append(Posting(seat=1, amount=s.bb, kind=PostingKind.BB))
 
@@ -500,6 +544,11 @@ class HoldemAdapter:
         return events
 
     def legal_actions(self, s: GameState, seat: int) -> list[ActionSpec]:
+        """`GameAdapter.legal_actions` (§9): the actions `seat` may legally
+        take right now — empty once the hand is complete, show/muck while a
+        discretionary showdown decision is pending on `seat`, otherwise the
+        fold/call/check/raise set derived from pokerkit's own betting state
+        (empty if it isn't `seat`'s turn to act)."""
         if s.phase == Phase.HAND_COMPLETE:
             return []
         if s.awaiting_showdown_seat == seat:
@@ -522,6 +571,21 @@ class HoldemAdapter:
         return specs
 
     def apply(self, s: GameState, seat: int, a: Action) -> list[Event]:
+        """`GameAdapter.apply` (§9): validate and apply `seat`'s submitted
+        action `a` against `s`, dispatching to the showdown or betting path.
+
+        Args:
+            s: the hand's `GameState`, mutated in place.
+            seat: the acting seat index.
+            a: the submitted action; validated here, not trusted (invariant 4).
+
+        Returns:
+            The events produced by applying `a`, including whatever
+            `_advance` drives automatically afterward.
+
+        Raises:
+            IllegalAction: if the hand is already complete or `a` is not currently legal for `seat`.
+        """
         if s.phase == Phase.HAND_COMPLETE:
             raise IllegalAction("hand is already complete", [])
         if a.type in (ActionType.SHOW, ActionType.MUCK):
@@ -529,6 +593,9 @@ class HoldemAdapter:
         return self._apply_betting_decision(s, seat, a)
 
     def _apply_betting_decision(self, s: GameState, seat: int, a: Action) -> list[Event]:
+        """Validate and apply a fold/check/call/raise from `seat`, then let
+        `_advance` drive any automatic follow-on (board dealing, next
+        `ACTION_REQUIRED`, or hand finalization)."""
         legal = self.legal_actions(s, seat)
         if a.type not in {spec.type for spec in legal}:
             raise IllegalAction(f"{a.type.value} is not legal for seat {seat}", legal)
@@ -573,6 +640,8 @@ class HoldemAdapter:
         return events
 
     def _apply_showdown_decision(self, s: GameState, seat: int, a: Action) -> list[Event]:
+        """Validate and apply `seat`'s discretionary show/muck decision,
+        then let `_advance` drive any automatic follow-on."""
         if s.awaiting_showdown_seat != seat:
             raise IllegalAction(f"seat {seat} has no showdown decision pending", [])
 
@@ -602,6 +671,14 @@ class HoldemAdapter:
         return events
 
     def view(self, s: GameState, seat: int) -> Observation:
+        """`GameAdapter.view` (§9, invariant 2): the *only* place redaction
+        happens — builds the `Observation` for `seat`, showing its own hole
+        cards unredacted and every other seat's only if `revealed`.
+
+        Args:
+            s: the hand's current `GameState`.
+            seat: the seat this view is being built for.
+        """
         pk = s.pk
         pots = tuple(pk.pots)  # materialized ONCE (§10 trap)
         pot_views = [PotView(index=i, amount=p.amount, eligible_seats=list(p.player_indices)) for i, p in enumerate(pots)]
@@ -677,6 +754,15 @@ class HoldemAdapter:
         )
 
     def waiting_view(self, cfg: dict[str, object], seats: list[SeatJoinedPayload], seat: int) -> Observation:
+        """`GameAdapter.waiting_view` (§9): the placeholder `Observation`
+        shown to `seat` before the hand has started (room still filling
+        seats) — no cards, no pot, no legal actions yet.
+
+        Args:
+            cfg: the room's game config (unused by holdem's waiting view but part of the adapter contract).
+            seats: the seats claimed so far.
+            seat: the seat this view is being built for.
+        """
         seat_views = [
             SeatView(
                 seat=s.seat,
@@ -721,7 +807,10 @@ class HoldemAdapter:
         )
 
     def is_terminal(self, s: GameState) -> bool:
+        """`GameAdapter.is_terminal` (§9): whether the current hand has finished resolving."""
         return s.phase == Phase.HAND_COMPLETE
 
     def results(self, s: GameState) -> dict[int, float]:
+        """`GameAdapter.results` (§9): each seat's net chip change for this
+        hand (current stack minus that seat's starting stack), keyed by seat index."""
         return {i: float(s.pk.stacks[i] - s.starting_stacks[i]) for i in range(s.seats_total)}

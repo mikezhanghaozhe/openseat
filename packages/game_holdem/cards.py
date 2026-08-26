@@ -35,8 +35,26 @@ def deal(operation: HoleDealing | BoardDealing) -> tuple[Card, ...]:
 
 
 def deal_hole(pk: State, cards: str) -> tuple[Card, ...]:
+    """Deal hole cards to the next seat awaiting them.
+
+    Args:
+        pk: the live pokerkit `State` to deal into.
+        cards: one concatenated card string (e.g. `"AsKd"`), typically built by `draw`.
+
+    Returns:
+        The dealt cards as `Card` instances (validated by `deal`).
+    """
     return deal(pk.deal_hole(cards))
 
 
 def deal_board(pk: State, cards: str) -> tuple[Card, ...]:
+    """Deal community (board) cards for the current street.
+
+    Args:
+        pk: the live pokerkit `State` to deal into.
+        cards: one concatenated card string (e.g. `"AsKd"`), typically built by `draw`.
+
+    Returns:
+        The dealt cards as `Card` instances (validated by `deal`).
+    """
     return deal(pk.deal_board(cards))

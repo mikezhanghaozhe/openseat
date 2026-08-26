@@ -32,6 +32,13 @@ class ArenaApiError(Exception):
     dedicated subclass."""
 
     def __init__(self, status_code: int, error: ErrorCode, reason: str, body: dict[str, object]) -> None:
+        """
+        Args:
+            status_code: HTTP status of the failed response.
+            error: protocol `ErrorCode` parsed from the response body.
+            reason: short human-readable explanation from the response body.
+            body: the full parsed error JSON, kept verbatim for fallback access.
+        """
         super().__init__(f"{error.value}: {reason}")
         self.status_code = status_code
         self.error = error
@@ -40,8 +47,13 @@ class ArenaApiError(Exception):
 
 
 class IllegalActionError(ArenaApiError):
+    """`ArenaApiError` for `illegal_action`, exposing the current
+    `legal_actions` so the caller can retry with a valid move instead of
+    just failing."""
+
     @property
     def legal_actions(self) -> list[ActionSpec]:
+        """Parse and return the `legal_actions` list carried in the error body."""
         raw = self.body.get("legal_actions", [])
         assert isinstance(raw, list)
         return [parse_action_spec(as_dict(item)) for item in raw]
