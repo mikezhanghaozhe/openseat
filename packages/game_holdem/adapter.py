@@ -72,25 +72,25 @@ class GameState:
     holds this only as an opaque `TypeVar` instance — see the CRITICAL
     BOUNDARY note in `packages/room_server/adapter.py`."""
 
-    pk: State
-    hand_no: int
-    button: int
-    seats_total: int
-    starting_stacks: list[int]
+    pk: State  # the wrapped pokerkit state; source of truth for cards, bets, stacks, and legality
+    hand_no: int  # 1-based index of the current hand within this room (increments each new hand)
+    button: int  # seat index holding the dealer button this hand; fixed at seats_total - 1 (see reset())
+    seats_total: int  # number of seats at the table, claimed or not
+    starting_stacks: list[int]  # each seat's stack at the start of THIS hand, in seat order (used by results())
     sb: int  # small blind: the smaller of the two forced pre-deal bets.
     bb: int  # big blind: the larger forced pre-deal bet; sb < bb always (see _check_cross_field_config).
-    ante: int
-    remaining_deck: list[str]
-    full_deck: list[str]
-    seat_status: list[SeatStatus]
-    last_action: dict[int, Action] = field(default_factory=dict)
-    revealed: dict[int, Reveal] = field(default_factory=dict)
-    board_deals_done: int = 0
-    phase: Phase = Phase.PREFLOP
-    awaiting_showdown_seat: int | None = None
+    ante: int  # per-seat forced bet posted before blinds, in addition to sb/bb; 0 if the room has no ante
+    remaining_deck: list[str]  # cards not yet dealt this hand, consumed in order by cards.draw()
+    full_deck: list[str]  # the complete shuffled deck this hand was dealt from, unmodified (echoed in HAND_COMPLETE)
+    seat_status: list[SeatStatus]  # each seat's ACTIVE/FOLDED/ALL_IN status this hand, in seat order
+    last_action: dict[int, Action] = field(default_factory=dict)  # seat -> most recent action it took this hand
+    revealed: dict[int, Reveal] = field(default_factory=dict)  # seat -> its shown hand, once revealed at showdown
+    board_deals_done: int = 0  # how many of flop/turn/river have been dealt so far (0-3)
+    phase: Phase = Phase.PREFLOP  # current betting round / hand stage, surfaced directly in Observation.phase
+    awaiting_showdown_seat: int | None = None  # seat with a pending discretionary show/muck decision, if any
     # seat -> hole cards, captured immediately at show time (see _build_reveal).
     pending_all_in_reveals: dict[int, list[str]] = field(default_factory=dict)
-    hand_had_showdown: bool = False
+    hand_had_showdown: bool = False  # whether this hand reached a real showdown (vs. an uncontested win)
     # Pre-drain snapshot, populated by _finalize before any push_chips()
     # call — see the `pots` property below.
     _final_pots: tuple[Pot, ...] | None = field(default=None, repr=False)
