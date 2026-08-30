@@ -814,3 +814,11 @@ class HoldemAdapter:
         """`GameAdapter.results` (§9): each seat's net chip change for this
         hand (current stack minus that seat's starting stack), keyed by seat index."""
         return {i: float(s.pk.stacks[i] - s.starting_stacks[i]) for i in range(s.seats_total)}
+
+    def can_win_now(self, s: GameState, seat: int) -> bool:
+        """`GameAdapter.can_win_now` (§9, §3.2): delegates directly to
+        PokerKit's own `state.can_win_now(seat)` — the only place this
+        primitive can live, since it compares against hands PokerKit itself
+        has already exposed at showdown. See §10 for what this does and
+        does not mean (not omniscient — never "this seat is the winner")."""
+        return bool(s.pk.can_win_now(seat))

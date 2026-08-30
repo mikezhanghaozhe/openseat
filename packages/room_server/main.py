@@ -1,4 +1,5 @@
-"""FastAPI app for the M1 REST surface (docs/PROTOCOL.md §6).
+"""FastAPI app for the M1 REST surface (docs/PROTOCOL.md §6) plus the M2
+WebSocket push layer registered by `ws.py` (§1, §8).
 
 `create_app` takes an adapter registry so a real game package can be wired
 in without this module importing it — see AGENTS.md invariant 7 and the
@@ -11,12 +12,14 @@ packages.room_server.main:app` serves real poker, not just the local
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse
 
-from packages.engine.types import Action, ActionType, ErrorCode
+from packages.agent_runtime.types import Provider
 from packages.room_server import config as server_config
 from packages.room_server.adapter import GameAdapter
 from packages.room_server.errors import ApiError
@@ -29,36 +32,20 @@ from packages.room_server.schemas import (
 from packages.room_server.serialize import to_wire, to_wire_dict
 from packages.room_server.store import PROTOCOL_VERSION, RoomStore
 from packages.room_server.stub import StubAdapter
+from packages.room_server.wire import bearer_token, parse_action
+from packages.room_server.ws import register_ws_route
 
-_BEARER_PREFIX = "Bearer "
-
-
-def _bearer_token(authorization: str | None) -> str | None:
-    """Extract the bearer token from an `Authorization` header value.
-
-    Args:
-        authorization: raw `Authorization` header, or None if absent.
-
-    Returns:
-        The token, or None if the header is missing, malformed, or empty after the prefix.
-    """
-    if authorization is None or not authorization.startswith(_BEARER_PREFIX):
-        return None
-    token = authorization[len(_BEARER_PREFIX) :].strip()
-    return token or None
-
-
-def _parse_action(action_in: ActionRequest) -> Action:
-    """Convert the wire `ActionRequest.action` into an engine `Action`.
-
-    Raises:
-        ApiError: `BAD_REQUEST` if `action_in.action.type` isn't a known `ActionType`.
-    """
-    try:
-        action_type = ActionType(action_in.action.type)
-    except ValueError as exc:
-        raise ApiError(ErrorCode.BAD_REQUEST, f"unknown action type {action_in.action.type!r}") from exc
-    return Action(type=action_type, to=action_in.action.to)
+# Without this, `agent_runtime.decide`'s per-decision `logger.info` (and
+# every `logger.warning`/`logger.error` on a provider failure) never reaches
+# the terminal running `make dev`: the root logger defaults to WARNING with
+# no handler, so INFO records are dropped before dispatch and even the
+# WARNING/ERROR ones have nowhere to print to. `basicConfig` is a documented
+# no-op if the root logger already has handlers (e.g. pytest's own log
+# capture during the test suite), so this is safe to call unconditionally
+# at import time rather than only under `if __name__ == "__main__"` — which
+# wouldn't fire anyway, since `uvicorn packages.room_server.main:app` only
+# imports this module, it never executes it as `__main__`.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 
 def _default_adapters() -> dict[str, GameAdapter[Any]]:
@@ -93,6 +80,7 @@ def _default_adapters() -> dict[str, GameAdapter[Any]]:
 def create_app(
     adapters: dict[str, GameAdapter[Any]] | None = None,
     allow_fixed_seed: bool | None = None,
+    model_provider_factory: Callable[[], Provider] | None = None,
 ) -> FastAPI:
     """Build the FastAPI app: wire a `RoomStore` over `adapters` (or the
     default registry) and register every §6 route against it.
@@ -101,11 +89,16 @@ def create_app(
         adapters: game-id -> `GameAdapter` registry; defaults to `_default_adapters()`.
         allow_fixed_seed: overrides `server_config.allow_fixed_seed()` when not None
             (used by tests to force fixed-seed rooms on/off deterministically).
+        model_provider_factory: builds the `agent_runtime.Provider` each room
+            uses for its `kind: "model"` seats; defaults to `OpenRouterProvider`
+            (docs/MILESTONES.md M3). Tests override this to inject a mocked
+            provider instead of reaching the real OpenRouter API.
     """
     registry: dict[str, GameAdapter[Any]] = adapters if adapters is not None else _default_adapters()
     store: RoomStore[Any] = RoomStore(
         adapters=registry,
         allow_fixed_seed=server_config.allow_fixed_seed() if allow_fixed_seed is None else allow_fixed_seed,
+        model_provider_factory=model_provider_factory,
     )
 
     app = FastAPI()
@@ -134,7 +127,15 @@ def create_app(
     async def claim_seat(room_id: str, body: ClaimSeatRequest) -> dict[str, object]:
         """`POST /v1/rooms/{room_id}/seats` — claim an open seat, returning its bearer `seat_token`."""
         room = store.get(room_id)
-        slot = await room.claim_seat(body.invite_token, body.seat, body.kind, body.display_name)
+        slot = await room.claim_seat(
+            body.invite_token,
+            body.seat,
+            body.kind,
+            body.display_name,
+            model=body.model,
+            key_mode=body.key_mode,
+            api_key=body.api_key,
+        )
         return {
             "protocol_version": PROTOCOL_VERSION,
             "seat_token": slot.seat_token,
@@ -159,7 +160,7 @@ def create_app(
         """`GET /v1/rooms/{room_id}/view` — the caller's redacted `Observation`
         for the seat identified by the bearer `seat_token`."""
         room = store.get(room_id)
-        seat_token = _bearer_token(authorization)
+        seat_token = bearer_token(authorization)
         obs = await room.view(seat_token)
         return to_wire_dict(obs)
 
@@ -168,8 +169,18 @@ def create_app(
         """`POST /v1/rooms/{room_id}/actions` — submit an action for the seat
         owning `body.seat_token`; `body.request_id` makes retries idempotent."""
         room = store.get(room_id)
-        action = _parse_action(body)
+        action = parse_action(body.action.type, body.action.to)
         result = await room.submit_action(body.seat_token, body.request_id, action, body.table_talk)
+        return {"protocol_version": PROTOCOL_VERSION, **result}
+
+    @app.post("/v1/rooms/{room_id}/ws-ticket")
+    async def ws_ticket(room_id: str, authorization: str | None = Header(default=None)) -> dict[str, object]:
+        """`POST /v1/rooms/{room_id}/ws-ticket` (§1) — mint a single-use, 30s
+        WS connection ticket for the seat or, given the room's
+        `invite_token` instead, a spectator."""
+        room = store.get(room_id)
+        token = bearer_token(authorization)
+        result = await room.issue_ws_ticket(token)
         return {"protocol_version": PROTOCOL_VERSION, **result}
 
     @app.get("/v1/rooms/{room_id}/events")
@@ -189,6 +200,8 @@ def create_app(
         room = store.get(room_id)
         result = await room.result()
         return {"protocol_version": PROTOCOL_VERSION, **result}
+
+    register_ws_route(app, store)
 
     return app
 

@@ -18,10 +18,13 @@ These are not negotiable and no package may violate them.
 2. **`GameAdapter.view(state, seat)` is the only place redaction happens.** No endpoint, no
    WebSocket frame, and no log line may serialize game state by any other path.
 3. **All randomness comes from the seeded RNG.** Same seed + same action sequence ⇒ identical
-   event log **excluding `ts`**. Wall-clock timestamps necessarily differ between runs; determinism
-   comparisons strip `ts` and compare on `seq` ordering plus payloads. No `random.random()` and no
-   `time.time()` anywhere in game logic — `ts` is stamped by the room server at emit time, outside
-   the adapter.
+   event log **excluding `ts` and `action_required.deadline_ms`**. Wall-clock timestamps necessarily
+   differ between runs; determinism comparisons strip both fields and compare on `seq` ordering plus
+   remaining payloads. Both are stamped from wall-clock time by the room server, outside the adapter
+   — not derived from the seeded RNG or from anything that affects game outcome — so neither can be
+   deterministic across runs, and neither needs to be. No `random.random()` and no `time.time()`
+   anywhere in game logic — `ts` and `deadline_ms` are stamped by the room server at emit time,
+   outside the adapter.
 4. **No model output is trusted.** Every action from every seat — human, model, or agent — is
    validated against `legal_actions` before it touches state.
 5. **`seq` is monotonic per room** and appears on every view and every event. It is the basis of
@@ -563,6 +566,12 @@ class GameAdapter(Protocol):
         # game-holdem returns an INTEGER chip delta (stack_after - starting_stack) in that float.
         # Never do further arithmetic on it, never round it, never treat it as money — render only.
         # The money path stays integer end to end; this is a reporting value.
+    def can_win_now(self, s: GameState, seat: int) -> bool: ...
+        # Whether `seat` can still win at least one pot, given hands already exposed at showdown
+        # (§3.1) — not omniscient, matches what a dealer could determine at that moment (§3.2, §10).
+        # The room server's only use for this is deciding the forced action on a showdown-phase
+        # turn-clock timeout (§3.2, §8): muck only if this is False, otherwise show. Must not be
+        # read as "this seat is the winner" — see §10.
 ```
 
 `apply` returns events rather than mutating visibly — the room server assigns `seq` and broadcasts.
@@ -685,7 +694,8 @@ answer. 52 strings per hand is not worth optimising away.
 - [ ] A short stack whose only raise is all-in (`min_to == max_to`) **still gets `raise` offered**
 - [ ] `max_raise_to == stacks[i] + bets[i]`, not `stacks[i]`
 - [ ] `pot_awarded.awards[].amount` sums exactly to the pot `amount`, including odd-chip splits
-- [ ] Two runs with the same seed produce identical logs once `ts` is stripped
+- [ ] Two runs with the same seed produce identical logs once `ts` and `action_required.deadline_ms`
+      are stripped
 - [ ] `GET /result` returns 200 after the room closes, and 409 before `hand_complete`
 - [ ] `POST /actions` response `last_seq` equals the highest `seq` that request emitted
 - [ ] Retrying a `request_id` with different `table_talk` but identical action does **not** conflict

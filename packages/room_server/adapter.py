@@ -103,3 +103,18 @@ class GameAdapter(Protocol[S]):
     def results(self, s: S) -> dict[int, float]:
         """Each seat's net outcome for the completed hand, keyed by seat index."""
         ...
+
+    def can_win_now(self, s: S, seat: int) -> bool:
+        """Whether `seat` can still win at least one pot, given hands
+        already exposed at showdown so far (§3.1) — not omniscient; this
+        matches what a dealer could determine at that moment, not a
+        comparison against every hidden hand (§3.2, §10).
+
+        Not in §9 as originally written — added so the room server can
+        decide the forced action on a showdown-phase turn-clock timeout
+        (§3.2, §8: muck only if this is `False`, otherwise show) without
+        reaching into adapter-internal state, which invariant 2's opaque `S`
+        TypeVar forbids. Must never be read as "this seat is the winner" —
+        see docs/DECISIONS.md.
+        """
+        ...

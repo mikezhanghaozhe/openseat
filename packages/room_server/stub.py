@@ -82,7 +82,6 @@ class StubAdapter:
 
     def validate_config(self, cfg: dict[str, object], seats: int) -> None:
         """No cross-field constraints beyond what `config_schema` already checks."""
-        pass
 
     def reset(self, cfg: dict[str, object], deck: list[str]) -> _StubState:
         """Start a new stub "hand": every seat active, seat 0 to act first,
@@ -320,3 +319,9 @@ class StubAdapter:
     def results(self, s: _StubState) -> dict[int, float]:
         """1.0 for each still-active seat, 0.0 for folded seats, keyed by seat index."""
         return {i: (1.0 if i in s.active else 0.0) for i in range(s.seats_total)}
+
+    def can_win_now(self, s: _StubState, seat: int) -> bool:
+        """The stub game has no showdown phase and no hidden information —
+        this is never actually consulted for a forced timeout decision, but
+        the protocol contract is still: any still-active seat can win."""
+        return seat in s.active

@@ -67,18 +67,28 @@ def test_reset_dealing_is_a_pure_function_of_the_deck_not_of_subsequent_play() -
 def test_pots_are_materialized_once_per_view_not_read_twice() -> None:
     """§10 checklist: "Deriving pots[] and pot_total uses one materialized
     tuple(state.pots)." `state.pots` is an iterator — exhausting it twice
-    yields inconsistent `pots[]`/`pot_total`. Checked at the black-box level
-    (the only way an outside caller can observe the bug): pot_total must
-    equal the sum of the pots' amounts on every single call to `view()`,
-    called repeatedly, not just once."""
+    within one `view()` call would silently drain it to empty on the second
+    read. This is NOT "pot_total == sum(pots[].amount)": `pk.pots` is empty
+    for an entire street until it closes (blinds sit as live, uncollected
+    `pk.bets` right after `reset()`), and `pot_total` deliberately adds those
+    in on top (docs/DECISIONS.md, "live bets belong in pot_total, not a
+    synthetic pots[] entry") — so the two are expected to disagree here, not
+    a bug. The real double-read symptom is `pots[]`/`pot_total` silently
+    draining/drifting across repeated `view()` calls with nothing else
+    changing; checked directly, plus the documented formula itself."""
     adapter = HoldemAdapter()
     state = adapter.reset(_cfg(3), _deck())
-    for _ in range(3):
-        obs = adapter.view(state, 0)
-        assert obs.pot_total == sum(p.amount for p in obs.pots), (
-            "pot_total disagrees with sum(pots[].amount) — state.pots was likely read twice "
-            "(once for pots[], once for pot_total) instead of materialized once"
-        )
+    observations = [adapter.view(state, 0) for _ in range(3)]
+
+    pot_totals = [obs.pot_total for obs in observations]
+    assert len(set(pot_totals)) == 1, f"pot_total drifted across repeated view() calls: {pot_totals}"
+    pots_lists = [obs.pots for obs in observations]
+    assert all(pots == pots_lists[0] for pots in pots_lists), "pots[] drifted across repeated view() calls"
+
+    obs = observations[0]
+    assert obs.pot_total == sum(p.amount for p in obs.pots) + sum(seat.committed_street for seat in obs.seats), (
+        "pot_total must equal settled pots[] plus this street's uncollected bets (docs/DECISIONS.md)"
+    )
 
 
 def test_rake_is_always_zero_and_runout_count_is_always_one() -> None:
