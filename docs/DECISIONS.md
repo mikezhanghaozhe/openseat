@@ -1032,3 +1032,42 @@ meant to guard: `pots[]`/`pot_total` must not drift across repeated `view()` cal
 happening (the real double-read symptom — a live iterator silently draining on a second read), plus
 the documented formula (`pot_total == sum(pots) + sum(committed_street across seats)`) explicitly,
 instead of the unconditional-equality assumption that was never true to begin with.
+
+**M3 model seats: driven from `Room._after_events`, reusing `timer_generation` as the staleness
+token.** When a fresh `action_required` names a seat that has a `ModelSeat` registered
+(`Room.model_seats`), `_after_events` spawns a background task the same way `_arm_timer` already
+does for the turn clock — same pattern, same "keep a strong ref or asyncio may GC the task" reason
+(`self._model_tasks`, mirroring `self.timer_task`). The task reads the seat's `Observation` under
+`self.lock`, releases it, awaits the provider (which can take seconds), then resubmits through
+`submit_action_for_seat` — the identical `_commit_action` path a human uses. Reusing
+`self.timer_generation` (already bumped on every `_arm_timer`/`_cancel_timer`) as the "has this turn
+already moved on" check avoids inventing a second generation counter for what is the same "is this
+still the live turn" question the turn clock already answers.
+
+**A model seat's `ApiError(NOT_YOUR_TURN)` is swallowed, not logged as a bug.** The task spec calls
+this out explicitly: the turn can legitimately move on between the observation read and the
+resubmit (a human acted first, or the turn timer forced an action first), and that must read as an
+ordinary race, not an error. Any *other* `ApiError` from that resubmit is logged — it would mean the
+seat's own decided action was rejected for a reason unrelated to turn ordering, which would be a
+real bug in `policy.validate` disagreeing with the adapter's own `legal_actions`.
+
+**API-key resolution happens at `POST /seats` time, not on first turn.** `Room._build_model_seat`
+calls `agent_runtime.driver.resolve_api_key` synchronously inside `claim_seat`, so a `key_mode:
+"house"` seat claimed with no `OPENROUTER_API_KEY` set, or a `key_mode: "byok"` seat claimed with no
+`api_key`, fails the seat claim with `400 bad_request` immediately — never a mysterious failure on
+the seat's first turn, and never a fallback to a wrong key.
+
+**`ModelSeat`'s 15s decide-timeout is read from the module global at construction time, not bound
+into the constructor's default-argument value.** A `def __init__(..., timeout_seconds: float =
+DEFAULT_TIMEOUT_SECONDS)` signature freezes the default at module-import time — Python evaluates
+default arguments once — which would make `monkeypatch.setattr(decide_module,
+"DEFAULT_TIMEOUT_SECONDS", ...)` silently no-op in tests. `timeout_seconds: float | None = None` plus
+an explicit `self._timeout_seconds = timeout_seconds if timeout_seconds is not None else
+DEFAULT_TIMEOUT_SECONDS` in the body reads the global fresh on every construction, so
+`tests/unit/test_agent_runtime.py::test_provider_timeout_falls_back_to_default_action` can shrink the
+real 15s cap to something a unit test can afford, by monkeypatching before the seat is claimed.
+
+**`create_app`/`RoomStore`/`Room` gained a `model_provider_factory` parameter, mirroring the existing
+`adapters` injection point.** Lets tests substitute a mocked `agent_runtime.Provider` (never
+touching the real OpenRouter API) the same way `adapters=` already substitutes `StubAdapter` for a
+real game — dependency injection at the same seam, not a new pattern.

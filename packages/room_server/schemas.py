@@ -18,6 +18,10 @@ class ClaimSeatRequest(BaseModel):
     seat: int | None = None
     kind: str
     display_name: str
+    # M3 model seats (docs/MILESTONES.md M3) — only meaningful when kind == "model".
+    model: str | None = None
+    key_mode: str | None = None  # "house" | "byok"
+    api_key: str | None = None  # BYOK only; never echoed back in any response
 
 
 class StartRequest(BaseModel):

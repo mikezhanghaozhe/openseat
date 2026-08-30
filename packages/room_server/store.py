@@ -13,13 +13,20 @@ invariant 6).
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import time
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Generic
 
 import jsonschema  # type: ignore[import-untyped]
 
+from packages.agent_runtime.decide import ModelSeat
+from packages.agent_runtime.driver import HouseKeyMissingError, resolve_api_key
+from packages.agent_runtime.openrouter import OpenRouterProvider
+from packages.agent_runtime.types import ModelSeatSpec, Provider
 from packages.engine.types import (
     Action,
     ActionRequiredPayload,
@@ -60,6 +67,8 @@ from packages.room_server.tokens import (
 _RANKS = "23456789TJQKA"
 _SUITS = "cdhs"
 PROTOCOL_VERSION = "0.1"
+
+logger = logging.getLogger("room_server.model_seats")
 
 # §1: ws-tickets are single-use and expire in 30s.
 _WS_TICKET_TTL_SECONDS = 30
@@ -125,6 +134,7 @@ class Room(Generic[S]):
         config: dict[str, object],
         seats_total: int,
         room_seed: int,
+        model_provider_factory: Callable[[], Provider] | None = None,
     ) -> None:
         """
         Args:
@@ -134,6 +144,11 @@ class Room(Generic[S]):
             config: the game-specific config, already validated at creation time.
             seats_total: number of seats to create (all "open" until claimed).
             room_seed: the RNG seed this room's deck shuffles derive from (never serialized).
+            model_provider_factory: builds the `agent_runtime.Provider` this
+                room's `kind: "model"` seats share; defaults to
+                `OpenRouterProvider` (docs/MILESTONES.md M3). Built lazily,
+                on the first model seat claimed — a room with no model seats
+                never constructs one.
         """
         self.room_id = room_id
         self.game = game
@@ -167,6 +182,16 @@ class Room(Generic[S]):
         # race" safe to implement as a plain asyncio.sleep + lock re-acquire.
         self.timer_task: asyncio.Task[None] | None = None
         self.timer_generation = 0
+
+        # -- M3 model seats (docs/MILESTONES.md M3) --------------------------
+        self._model_provider_factory: Callable[[], Provider] = model_provider_factory or OpenRouterProvider
+        self._model_provider: Provider | None = None
+        self.model_seats: dict[int, ModelSeat] = {}
+        # Strong refs to in-flight driver tasks — `asyncio.create_task`
+        # alone doesn't keep a task alive against GC (same reason
+        # `self.timer_task` exists above); discarded via the task's own
+        # done-callback once it finishes.
+        self._model_tasks: set[asyncio.Task[None]] = set()
 
     # -- internal helpers, only ever called while `self.lock` is held ------
 
@@ -407,11 +432,74 @@ class Room(Generic[S]):
         action_required = next((ev for ev in reversed(stamped) if ev.type == EventType.ACTION_REQUIRED), None)
         if action_required is not None:
             self._arm_timer(action_required)
+            assert isinstance(action_required.payload, ActionRequiredPayload)
+            seat = action_required.payload.seat
+            if seat in self.model_seats:
+                self._spawn_model_seat_task(seat, self.timer_generation)
+
+    def _spawn_model_seat_task(self, seat: int, generation: int) -> None:
+        """Kick off the background task that drives a model seat's turn
+        (docs/MILESTONES.md M3), keeping a strong reference so it survives
+        GC until it completes. Must be called with `self.lock` already held."""
+        task = asyncio.create_task(self._drive_model_seat(seat, generation))
+        self._model_tasks.add(task)
+        task.add_done_callback(self._model_tasks.discard)
+
+    async def _drive_model_seat(self, seat: int, generation: int) -> None:
+        """Read `seat`'s observation, call its provider, then submit the
+        resulting action through the exact same `_commit_action` path a
+        human uses (AGENTS.md invariant 4) — never a shortcut.
+
+        The provider call happens with `self.lock` released: it can take
+        seconds, and holding the lock across it would freeze the whole
+        table for every other seat (docs/MILESTONES.md M3 task spec). By
+        the time the decision comes back the turn may have moved on — a
+        human acted first, or the turn clock forced an action — in which
+        case `submit_action_for_seat` raises its ordinary `NOT_YOUR_TURN`
+        `ApiError`, handled here as ordinary, expected, not-a-bug.
+        """
+        async with self.lock:
+            if generation != self.timer_generation or self.closed or self.state is None:
+                return
+            model_seat = self.model_seats.get(seat)
+            if model_seat is None:
+                return
+            obs = self._observation_for_seat(seat)
+
+        decision = await model_seat.decide(obs)
+
+        try:
+            result = await self.submit_action_for_seat(seat, str(uuid.uuid4()), decision.action, None)
+            logger.info(
+                "model seat %d action %s committed at seq %s-%s",
+                seat,
+                decision.action.type.value,
+                result["first_seq"],
+                result["last_seq"],
+            )
+        except ApiError as exc:
+            if exc.code is ErrorCode.NOT_YOUR_TURN:
+                return
+            logger.warning(
+                "model seat %d action %s rejected unexpectedly: %s (%s)",
+                seat,
+                decision.action.type.value,
+                exc.reason,
+                exc.code.value,
+            )
 
     # -- public API, each acquires the room's lock --------------------------
 
     async def claim_seat(
-        self, invite_token: str | None, seat_index: int | None, kind: str, display_name: str
+        self,
+        invite_token: str | None,
+        seat_index: int | None,
+        kind: str,
+        display_name: str,
+        *,
+        model: str | None = None,
+        key_mode: str | None = None,
+        api_key: str | None = None,
     ) -> SeatSlot:
         """Claim an open seat (or a specific `seat_index`) for a new player,
         issuing its bearer `seat_token`.
@@ -421,9 +509,18 @@ class Room(Generic[S]):
             seat_index: specific seat to claim; if None, the first open seat is used.
             kind: seat kind string (e.g. "human"/"model"); must parse as a `SeatKind`.
             display_name: name to show for this seat.
+            model: OpenRouter model id (e.g. `"anthropic/claude-sonnet-4.5"`);
+                required, and only meaningful, when `kind == "model"`
+                (docs/MILESTONES.md M3).
+            key_mode: `"house"` or `"byok"`; required when `kind == "model"`.
+            api_key: BYOK key; required when `key_mode == "byok"`. Resolved
+                immediately and held only in memory for this room's lifetime
+                (AGENTS.md invariant 6) — never stored on the returned
+                `SeatSlot` and never echoed back in any response body.
 
         Raises:
-            ApiError: `INVALID_TOKEN`, `BAD_REQUEST` (bad kind or index), `SEAT_TAKEN`, or `ROOM_FULL`.
+            ApiError: `INVALID_TOKEN`, `BAD_REQUEST` (bad kind/index, or a
+                missing/invalid model-seat field), `SEAT_TAKEN`, or `ROOM_FULL`.
         """
         async with self.lock:
             if not tokens_equal(invite_token, self.invite_token):
@@ -432,6 +529,11 @@ class Room(Generic[S]):
                 seat_kind = SeatKind(kind)
             except ValueError as exc:
                 raise ApiError(ErrorCode.BAD_REQUEST, f"unknown seat kind {kind!r}") from exc
+
+            model_seat: ModelSeat | None = None
+            if seat_kind == SeatKind.MODEL:
+                model_seat = self._build_model_seat(model, key_mode, api_key)
+
             if seat_index is not None:
                 if not (0 <= seat_index < len(self.seats)):
                     raise ApiError(ErrorCode.BAD_REQUEST, "seat index out of range")
@@ -447,8 +549,33 @@ class Room(Generic[S]):
             slot.kind = seat_kind
             slot.name = display_name
             slot.seat_token = new_seat_token()
+            if model_seat is not None:
+                self.model_seats[slot.index] = model_seat
             self._emit(EventType.SEAT_JOINED, SeatJoinedPayload(seat=slot.index, name=slot.name, kind=slot.kind))
             return slot
+
+    def _build_model_seat(self, model: str | None, key_mode: str | None, api_key: str | None) -> ModelSeat:
+        """Validate and resolve a `kind: "model"` seat's claim-time fields
+        into a ready-to-use `ModelSeat`, building this room's shared
+        `Provider` on first use.
+
+        Raises:
+            ApiError: `BAD_REQUEST` for a missing `model`/`key_mode`, an
+                unknown `key_mode`, a missing BYOK `api_key`, or a missing
+                house key (`OPENROUTER_API_KEY` unset).
+        """
+        if not model:
+            raise ApiError(ErrorCode.BAD_REQUEST, "model seats require 'model'")
+        if key_mode is None or key_mode not in ("house", "byok"):
+            raise ApiError(ErrorCode.BAD_REQUEST, f"model seats require key_mode 'house' or 'byok', got {key_mode!r}")
+        spec = ModelSeatSpec(model=model, key_mode=key_mode, api_key=api_key)
+        try:
+            resolved_key = resolve_api_key(spec)
+        except (ValueError, HouseKeyMissingError) as exc:
+            raise ApiError(ErrorCode.BAD_REQUEST, str(exc)) from exc
+        if self._model_provider is None:
+            self._model_provider = self._model_provider_factory()
+        return ModelSeat(spec=spec, provider=self._model_provider, api_key=resolved_key)
 
     async def start(self, host_token: str | None) -> dict[str, object]:
         """Host-only: begin play once every seat is claimed — shuffle the
@@ -758,14 +885,22 @@ class RoomStore(Generic[S]):
     """Registry of all live `Room`s, keyed by room id. Owns room creation
     (including config validation) and lookup; per-room mutation lives on `Room` itself."""
 
-    def __init__(self, adapters: dict[str, GameAdapter[S]], allow_fixed_seed: bool) -> None:
+    def __init__(
+        self,
+        adapters: dict[str, GameAdapter[S]],
+        allow_fixed_seed: bool,
+        model_provider_factory: Callable[[], Provider] | None = None,
+    ) -> None:
         """
         Args:
             adapters: game-id -> `GameAdapter` registry available for room creation.
             allow_fixed_seed: whether `create_room` may accept a caller-supplied RNG seed.
+            model_provider_factory: passed through to every `Room` this store
+                creates; see `Room.__init__`.
         """
         self._adapters = adapters
         self._allow_fixed_seed = allow_fixed_seed
+        self._model_provider_factory = model_provider_factory
         self._rooms: dict[str, Room[S]] = {}
         self._lock = asyncio.Lock()
 
@@ -821,6 +956,7 @@ class RoomStore(Generic[S]):
                 config=config,
                 seats_total=seats,
                 room_seed=room_seed,
+                model_provider_factory=self._model_provider_factory,
             )
             # Emitted before the room is published into `_rooms` below, so no
             # concurrent reader can observe the room without its first event.

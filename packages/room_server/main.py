@@ -12,11 +12,14 @@ packages.room_server.main:app` serves real poker, not just the local
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse
 
+from packages.agent_runtime.types import Provider
 from packages.room_server import config as server_config
 from packages.room_server.adapter import GameAdapter
 from packages.room_server.errors import ApiError
@@ -31,6 +34,18 @@ from packages.room_server.store import PROTOCOL_VERSION, RoomStore
 from packages.room_server.stub import StubAdapter
 from packages.room_server.wire import bearer_token, parse_action
 from packages.room_server.ws import register_ws_route
+
+# Without this, `agent_runtime.decide`'s per-decision `logger.info` (and
+# every `logger.warning`/`logger.error` on a provider failure) never reaches
+# the terminal running `make dev`: the root logger defaults to WARNING with
+# no handler, so INFO records are dropped before dispatch and even the
+# WARNING/ERROR ones have nowhere to print to. `basicConfig` is a documented
+# no-op if the root logger already has handlers (e.g. pytest's own log
+# capture during the test suite), so this is safe to call unconditionally
+# at import time rather than only under `if __name__ == "__main__"` — which
+# wouldn't fire anyway, since `uvicorn packages.room_server.main:app` only
+# imports this module, it never executes it as `__main__`.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 
 def _default_adapters() -> dict[str, GameAdapter[Any]]:
@@ -65,6 +80,7 @@ def _default_adapters() -> dict[str, GameAdapter[Any]]:
 def create_app(
     adapters: dict[str, GameAdapter[Any]] | None = None,
     allow_fixed_seed: bool | None = None,
+    model_provider_factory: Callable[[], Provider] | None = None,
 ) -> FastAPI:
     """Build the FastAPI app: wire a `RoomStore` over `adapters` (or the
     default registry) and register every §6 route against it.
@@ -73,11 +89,16 @@ def create_app(
         adapters: game-id -> `GameAdapter` registry; defaults to `_default_adapters()`.
         allow_fixed_seed: overrides `server_config.allow_fixed_seed()` when not None
             (used by tests to force fixed-seed rooms on/off deterministically).
+        model_provider_factory: builds the `agent_runtime.Provider` each room
+            uses for its `kind: "model"` seats; defaults to `OpenRouterProvider`
+            (docs/MILESTONES.md M3). Tests override this to inject a mocked
+            provider instead of reaching the real OpenRouter API.
     """
     registry: dict[str, GameAdapter[Any]] = adapters if adapters is not None else _default_adapters()
     store: RoomStore[Any] = RoomStore(
         adapters=registry,
         allow_fixed_seed=server_config.allow_fixed_seed() if allow_fixed_seed is None else allow_fixed_seed,
+        model_provider_factory=model_provider_factory,
     )
 
     app = FastAPI()
@@ -106,7 +127,15 @@ def create_app(
     async def claim_seat(room_id: str, body: ClaimSeatRequest) -> dict[str, object]:
         """`POST /v1/rooms/{room_id}/seats` — claim an open seat, returning its bearer `seat_token`."""
         room = store.get(room_id)
-        slot = await room.claim_seat(body.invite_token, body.seat, body.kind, body.display_name)
+        slot = await room.claim_seat(
+            body.invite_token,
+            body.seat,
+            body.kind,
+            body.display_name,
+            model=body.model,
+            key_mode=body.key_mode,
+            api_key=body.api_key,
+        )
         return {
             "protocol_version": PROTOCOL_VERSION,
             "seat_token": slot.seat_token,
