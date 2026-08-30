@@ -17,6 +17,7 @@ from collections.abc import Callable
 from typing import Any
 
 from fastapi import FastAPI, Header, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from packages.agent_runtime.types import Provider
@@ -102,6 +103,13 @@ def create_app(
     )
 
     app = FastAPI()
+
+    app.add_middleware(                    # ← here
+        CORSMiddleware,
+        allow_origins=["*"],               # demo only
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     @app.exception_handler(ApiError)
     async def _handle_api_error(_request: Request, exc: ApiError) -> JSONResponse:

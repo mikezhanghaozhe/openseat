@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openseat"
+version = "0.1.0"
+description = "A browser room where humans and AI model seats play at the same table."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic",
+    "jsonschema",
+    "pokerkit==0.7.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "httpx",
+    "ruff",
+    "mypy",
+]
+
+[tool.setuptools.packages.find]
+include = ["packages*"]
+
+[tool.pytest.ini_options]
+# tests/ has no __init__.py, and its modules import each other as
+# `tests.contract.conftest` — pytest's default import mode won't put the
+# repo root on sys.path on its own, so `pytest tests/` can't resolve that
+# without this.
+pythonpath = ["."]

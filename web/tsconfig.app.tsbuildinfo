@@ -1,0 +1,1 @@
+{"root":["./src/api.ts","./src/main.tsx","./src/protocol.ts","./src/useroomsocket.ts","./src/vite-env.d.ts","./src/components/actionbar.tsx","./src/components/card.tsx","./src/components/chat.tsx","./src/components/eventfeed.tsx","./src/components/potdisplay.tsx","./src/components/seatcard.tsx","./src/screens/joinscreen.tsx","./src/screens/roomscreen.tsx"],"version":"6.0.3"}

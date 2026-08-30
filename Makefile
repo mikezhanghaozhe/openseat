@@ -10,7 +10,7 @@ test-contract:
 	pytest tests/contract/ -v
 
 dev:
-	uvicorn packages.room_server.main:app --reload --port 8000
+	uvicorn packages.room_server.main:app --reload --reload-dir packages --port 8000
 
 hand:
 	bash scripts/play_hand.sh
